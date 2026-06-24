@@ -1,4 +1,6 @@
-# mcp-read-file-server：文件操作 MCP Server（加密软件环境明文读写）
+# 文件操作 MCP Server（加密软件环境明文读写）
+
+## 简介
 
 加密环境文件操作工具。当 Node.js 是加密软件白名单进程时，通过 fs 模块自动解密读写文件明文，替代 AI Agent 内置文件工具，解决加密环境下读到密文的问题。适用于任何支持 MCP 协议的 AI Agent。
 
@@ -67,11 +69,55 @@ npm install
 
 ### Claude Code CLI
 
-项目级（`.mcp.json`）或全局（`claude mcp add`）：
+#### 方式一：项目级配置（仅当前项目可用）
+
+在项目根目录创建 `.mcp.json` 文件：
+
+```json
+{
+  "mcpServers": {
+    "read-file-server": {
+      "command": "node",
+      "args": ["D:/AiJiamiToolsPlugins/mcp-read-file-server/index.js"]
+    }
+  }
+}
+```
+
+#### 方式二：全局配置（所有项目可用）
 
 ```bash
-claude mcp add read-file-server --command node --args "/path/to/mcp-read-file-server/index.js"
+claude mcp add read-file-server -s user -- node "D:/AiJiamiToolsPlugins/mcp-read-file-server/index.js"
 ```
+
+参数说明：
+- `read-file-server`：MCP Server 名称（自定义）
+- `-s user`：作用域为全局（所有项目可用），不写则默认项目级
+- `--`：分隔符，后面是实际执行的命令
+- `node "..."`：实际执行的命令
+
+#### 方式三：手动编辑全局配置文件
+
+直接编辑 `C:\Users\你的用户名\.claude.json`，添加：
+
+```json
+{
+  "mcpServers": {
+    "read-file-server": {
+      "command": "node",
+      "args": ["D:/AiJiamiToolsPlugins/mcp-read-file-server/index.js"]
+    }
+  }
+}
+```
+
+#### 验证配置
+
+```bash
+claude mcp list
+```
+
+应该能看到 `read-file-server` 在列表中。
 
 ### Cursor / Windsurf / Cline 等
 
