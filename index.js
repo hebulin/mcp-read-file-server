@@ -33,8 +33,8 @@ const server = new McpServer({ name: "read-file-server", version: "1.0.0" });
 function readFileContent(filePath) {
   try {
     const content = fs.readFileSync(filePath, "utf-8");
-    const stat = fs.statSync(filePath);
-    return { ok: true, content, size: stat.size };
+    // 加密环境下 stat.size 是密文字节数，与明文长度不一致，改用明文字节数避免误导
+    return { ok: true, content, size: Buffer.byteLength(content, "utf-8") };
   } catch (e) {
     if (e.code === "ENOENT") {
       return { ok: false, error: "文件不存在: " + filePath };
@@ -48,6 +48,7 @@ server.tool(
   "read_file",
   "读取指定路径的文件内容（明文）。加密软件环境下，Node.js 进程作为白名单可自动解密读取明文。适用于读取代码、配置、文档等文本文件。替代内置 Read 工具。",
   { path: z.string().describe("文件路径，支持相对路径或绝对路径") },
+  { readOnlyHint: true },
   async ({ path: filePath }) => {
     const result = readFileContent(filePath);
     if (result.ok) {
@@ -63,6 +64,7 @@ server.tool(
   "read_files",
   "批量读取多个文件的内容（明文）。多个路径用逗号分隔。加密软件环境下通过 Node.js 白名单进程自动解密。",
   { paths: z.string().describe("文件路径列表，多个路径用英文逗号分隔") },
+  { readOnlyHint: true },
   async ({ paths: pathsStr }) => {
     const pathList = pathsStr.split(",").map(p => p.trim()).filter(p => p);
     if (!pathList.length) {
@@ -91,6 +93,11 @@ server.tool(
   },
   async ({ path: filePath, content }) => {
     try {
+      // 自动创建父目录，避免新文件路径不存在时直接报错
+      const parent = path.dirname(filePath);
+      if (parent && !fs.existsSync(parent)) {
+        fs.mkdirSync(parent, { recursive: true });
+      }
       fs.writeFileSync(filePath, content, "utf-8");
       return { content: [{ type: "text", text: "✅ 写入成功: " + filePath }] };
     } catch (e) {
@@ -190,9 +197,11 @@ server.tool(
     onlyMatching: z.boolean().optional().describe("是否只输出匹配部分（非整行），默认 false 输出整行"),
     maxResults: z.number().optional().describe("最大返回匹配数，默认 200。超过会在末尾提示被截断"),
   },
+  { readOnlyHint: true },
   async ({ pattern, path: rootDir, include, ignoreCase, onlyMatching, maxResults }) => {
     try {
-      const flags = ignoreCase ? "g" : "";
+      // 修正：忽略大小写时需同时携带 g 与 i 标志，否则 ignoreCase 参数失效
+      const flags = ignoreCase ? "gi" : "g";
       let regex;
       try {
         regex = new RegExp(pattern, flags);
@@ -240,13 +249,27 @@ server.tool(
             const lines = content.split(/\r?\n/);
             let fileHit = false;
             for (let i = 0; i < lines.length; i++) {
-              regex.lastIndex = 0;
-              const m = regex.exec(lines[i]);
-              if (m) {
-                if (!fileHit) { fileHit = true; matchedFiles++; }
-                const text = onlyMatching ? m[0] : lines[i];
-                results.push(full + ":" + (i + 1) + ":" + text);
-                if (results.length >= limit) { truncated = true; return; }
+              if (truncated) break;
+              const line = lines[i];
+              if (onlyMatching) {
+                // onlyMatching 模式：输出一行内的所有匹配片段（原实现仅取第一个）
+                regex.lastIndex = 0;
+                let m;
+                while ((m = regex.exec(line)) !== null) {
+                  if (!fileHit) { fileHit = true; matchedFiles++; }
+                  results.push(full + ":" + (i + 1) + ":" + m[0]);
+                  if (results.length >= limit) { truncated = true; break; }
+                  // 防止零宽匹配导致死循环
+                  if (m.index === regex.lastIndex) regex.lastIndex++;
+                }
+              } else {
+                // 整行模式：一行只输出一条
+                regex.lastIndex = 0;
+                if (regex.exec(line)) {
+                  if (!fileHit) { fileHit = true; matchedFiles++; }
+                  results.push(full + ":" + (i + 1) + ":" + line);
+                  if (results.length >= limit) { truncated = true; }
+                }
               }
             }
           }
@@ -287,6 +310,7 @@ server.tool(
   "file_info",
   "查询文件或目录的信息：是否存在、类型、大小、修改时间等。加密软件环境下 stat 不读内容，结果准确。",
   { path: z.string().describe("文件或目录路径，支持相对路径或绝对路径") },
+  { readOnlyHint: true },
   async ({ path: filePath }) => {
     try {
       const stat = fs.statSync(filePath);
@@ -313,6 +337,7 @@ server.tool(
   "check_status",
   "检查文件操作工具的运行状态，确认 Node.js 进程能否正常读取加密文件明文。",
   {},
+  { readOnlyHint: true },
   async () => {
     return { content: [{ type: "text", text: "✅ read-file-server 运行中\n平台: Node.js " + process.version + "\n功能: 通过 Node.js fs 读写文件明文（加密软件白名单中的 Node.js 进程自动解密/加密）" }] };
   }
