@@ -144,24 +144,72 @@ claude mcp list
 
 ## 配套 Skill（可选）
 
-本工具附带一份 Claude Code Skill：`SKILL.md`，位于本目录根下。
+本工具附带一份 Skill：`SKILL.md`，位于本目录根下。
 
 | 项 | 说明 |
 |----|------|
 | 作用 | 教 AI Agent 在加密环境下主动选用 `mcp__read-file-server__*` 工具，避开内置 Read/Write/Edit/Grep |
-| 适用 | Claude Code（其他 Agent 暂未支持 Skill） |
-| 安装位置 | 项目级：`<本仓库>/.claude/skills/encryption-file-ops/SKILL.md`<br>用户级：`~/.claude/skills/encryption-file-ops/SKILL.md` |
-| 当前状态 | `SKILL.md` 在工具根目录，**未安装**，需要手动复制到上述位置才生效 |
+| 当前状态 | `SKILL.md` 在工具根目录，**未安装**，需要按下面步骤复制到对应位置才生效 |
+| 触发关键词 | 天锐、绿盾、密文、TSD、IP-Guard、亿赛通、白名单、读不到文件等 |
 
-安装示例（项目级）：
+### 1. 安装到 Claude Code
+
+Claude Code 启动时会自动扫描 `skills/` 目录，每个 Skill 必须是 `skill-name/SKILL.md` 的子目录结构。
+
+| 作用域 | 安装位置 |
+|--------|----------|
+| 项目级（仅本项目） | `<本仓库>/.claude/skills/encryption-file-ops/SKILL.md` |
+| 用户级（所有项目） | `~/.claude/skills/encryption-file-ops/SKILL.md` |
+
+安装示例（项目级，从本目录执行）：
 
 ```bash
-# 从本目录出发
 mkdir -p ../.claude/skills/encryption-file-ops
 cp SKILL.md ../.claude/skills/encryption-file-ops/SKILL.md
 ```
 
-安装后重启 Claude Code 即可生效。触发关键词：天锐、绿盾、密文、TSD、白名单、读不到文件等。
+安装后**重启 Claude Code** 即可生效。
+
+### 2. 安装到 OpenClaw（小龙虾）
+
+> ⚠️ 以下为通用约定写法，OpenClaw 的 Skill 加载机制请以其官方文档为准，确认后可对本节做相应调整。
+
+**方式一：让 OpenClaw 自动安装**
+
+把 `SKILL.md` 交给 OpenClaw，用自然语言让它自己装：
+
+```
+我把一个 Skill 文件放在 D:/AiJiamiToolsPlugins/mcp-read-file-server/SKILL.md，
+请按 OpenClaw 的 Skill 规范把它安装到我的 skills 目录，并确认能否被加载。
+```
+
+OpenClaw 会读取文件、确认 frontmatter（`name` / `description`），并复制到它自己的 Skill 目录。装完后可让它自检：
+
+```
+列出你当前已加载的所有 Skill，确认 encryption-file-ops 是否在其中。
+```
+
+**方式二：手动复制**
+
+```bash
+# 以 OpenClaw 默认 skill 目录 ~/.openclaw/skills 为例
+mkdir -p ~/.openclaw/skills/encryption-file-ops
+cp SKILL.md ~/.openclaw/skills/encryption-file-ops/SKILL.md
+```
+
+> 配置目录名（`.openclaw`）仅为示例，请替换为 OpenClaw 实际使用的目录。
+
+**方式三：项目级随仓库分发**
+
+如果希望 Skill 跟随项目走（团队成员拉代码即生效），把 SKILL.md 放进项目的 Skill 扫描目录（例如 `<仓库根>/.openclaw/skills/encryption-file-ops/SKILL.md`），与 OpenClaw 的项目级 Skill 约定保持一致即可。
+
+### 3. 验证安装
+
+无论哪种 Agent，安装后重启客户端，然后：
+
+1. 输入触发关键词测试，例如："这个项目里有文件加密，读文件是密文，怎么办？"
+2. 观察是否自动选用 `mcp__read-file-server__*` 工具而非内置 Read/Grep
+
 
 ## 在新电脑上使用
 
