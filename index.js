@@ -211,6 +211,7 @@ server.tool(
       const includeList = include
         ? include.split(",").map((s) => s.trim()).filter(Boolean)
         : null;
+      // include glob 匹配: 仅比对文件名(不含目录), * -> .*, 其余转义
       const matchesInclude = (name) => {
         if (!includeList) return true;
         return includeList.some((pat) => {
@@ -223,6 +224,43 @@ server.tool(
       let truncated = false;
       let scanned = 0;
       let matchedFiles = 0;
+      // 对单个文件做内容匹配, 复用与目录遍历相同的行级逻辑
+      const scanFile = (full) => {
+        if (!matchesInclude(path.basename(full))) return;
+        scanned++;
+        let content;
+        try {
+          content = fs.readFileSync(full, "utf-8");
+        } catch (e) {
+          return;
+        }
+        const lines = content.split(/\r?\n/);
+        let fileHit = false;
+        for (let i = 0; i < lines.length; i++) {
+          if (truncated) break;
+          const line = lines[i];
+          if (onlyMatching) {
+            // onlyMatching 模式：输出一行内的所有匹配片段（原实现仅取第一个）
+            regex.lastIndex = 0;
+            let m;
+            while ((m = regex.exec(line)) !== null) {
+              if (!fileHit) { fileHit = true; matchedFiles++; }
+              results.push(full + ":" + (i + 1) + ":" + m[0]);
+              if (results.length >= limit) { truncated = true; break; }
+              // 防止零宽匹配导致死循环
+              if (m.index === regex.lastIndex) regex.lastIndex++;
+            }
+          } else {
+            // 整行模式：一行只输出一条
+            regex.lastIndex = 0;
+            if (regex.exec(line)) {
+              if (!fileHit) { fileHit = true; matchedFiles++; }
+              results.push(full + ":" + (i + 1) + ":" + line);
+              if (results.length >= limit) { truncated = true; }
+            }
+          }
+        }
+      };
       const walk = (dir) => {
         if (truncated) return;
         let entries;
@@ -238,44 +276,27 @@ server.tool(
             if (["node_modules", ".git", "target", "build", "dist", ".idea", ".vscode"].includes(entry.name)) continue;
             walk(full);
           } else if (entry.isFile()) {
-            if (!matchesInclude(entry.name)) continue;
-            scanned++;
-            let content;
-            try {
-              content = fs.readFileSync(full, "utf-8");
-            } catch (e) {
-              continue;
-            }
-            const lines = content.split(/\r?\n/);
-            let fileHit = false;
-            for (let i = 0; i < lines.length; i++) {
-              if (truncated) break;
-              const line = lines[i];
-              if (onlyMatching) {
-                // onlyMatching 模式：输出一行内的所有匹配片段（原实现仅取第一个）
-                regex.lastIndex = 0;
-                let m;
-                while ((m = regex.exec(line)) !== null) {
-                  if (!fileHit) { fileHit = true; matchedFiles++; }
-                  results.push(full + ":" + (i + 1) + ":" + m[0]);
-                  if (results.length >= limit) { truncated = true; break; }
-                  // 防止零宽匹配导致死循环
-                  if (m.index === regex.lastIndex) regex.lastIndex++;
-                }
-              } else {
-                // 整行模式：一行只输出一条
-                regex.lastIndex = 0;
-                if (regex.exec(line)) {
-                  if (!fileHit) { fileHit = true; matchedFiles++; }
-                  results.push(full + ":" + (i + 1) + ":" + line);
-                  if (results.length >= limit) { truncated = true; }
-                }
-              }
-            }
+            scanFile(full);
           }
         }
       };
-      walk(rootDir);
+      // path 既可能是目录也可能是单个文件: 文件直接搜, 目录递归遍历
+      // 修复: 旧实现无视 path 类型一律 readdirSync, 传入文件路径时 ENOTDIR 被吞,
+      //       静默返回"扫描 0 个文件", 误导调用方以为无匹配
+      let stat;
+      try {
+        stat = fs.statSync(rootDir);
+      } catch (e) {
+        if (e.code === "ENOENT") {
+          return { content: [{ type: "text", text: "❌ 路径不存在: " + rootDir }], isError: true };
+        }
+        return { content: [{ type: "text", text: "❌ 无法访问路径: " + e.message }], isError: true };
+      }
+      if (stat.isFile()) {
+        scanFile(rootDir);
+      } else if (stat.isDirectory()) {
+        walk(rootDir);
+      }
       let text = results.join("\n");
       if (results.length === 0) {
         text = "未找到匹配项（扫描 " + scanned + " 个文件，根目录: " + rootDir + "）";
