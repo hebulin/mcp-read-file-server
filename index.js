@@ -10,14 +10,15 @@
  * 适用于任何「Node.js 是加密软件白名单进程」的场景。
  *
  * 提供工具：
- *   - read_file      读取单个文件明文（替代内置 Read）
- *   - read_files     批量读取多个文件明文
- *   - write_file     写入文件，自动加密落盘（替代内置 Write）
- *   - edit_file      精确字符串/正则替换后写回（替代内置 Edit/MultiEdit）
- *   - search_files   递归搜索文件内容（替代内置 Grep）
- *   - create_directory  递归创建目录
- *   - file_info      查询文件/目录信息
- *   - check_status   检查工具运行状态
+ *   - read_file          读取单个文件明文（替代内置 Read）
+ *   - read_files         批量读取多个文件明文
+ *   - read_file_partial  局部读取文件（前N字符 / 指定行范围）
+ *   - write_file         写入文件，自动加密落盘（替代内置 Write）
+ *   - edit_file          精确字符串/正则替换后写回（替代内置 Edit/MultiEdit）
+ *   - search_files       递归搜索文件内容（替代内置 Grep）
+ *   - create_directory   递归创建目录
+ *   - file_info          查询文件/目录信息
+ *   - check_status       检查工具运行状态
  */
 const fs = require("fs");
 const path = require("path");
@@ -80,6 +81,64 @@ server.tool(
       }
     }
     return { content: [{ type: "text", text: results.join("\n\n") }] };
+  }
+);
+
+// 注册 read_file_partial 工具（局部读取，按字符数或行号范围）
+server.tool(
+  "read_file_partial",
+  "局部读取文件内容（明文）。支持两种模式：①按字符数读取前N个字符；②按行号读取指定行或行范围（如第10行、第5-20行）。加密软件环境下同样通过 Node.js 白名单进程自动解密。适用于大文件预览、定位特定行内容等场景。",
+  {
+    path: z.string().describe("文件路径，支持相对路径或绝对路径"),
+    mode: z.enum(["chars", "lines"]).describe("读取模式：chars=按字符数读取前N个字符；lines=按行号读取指定行或行范围"),
+    charCount: z.number().int().positive().optional().describe("mode=chars 时必填，读取前N个字符"),
+    startLine: z.number().int().min(1).optional().describe("mode=lines 时必填，起始行号（从1开始）"),
+    endLine: z.number().int().min(1).optional().describe("mode=lines 时可选，结束行号（含）。不传则只读取 startLine 一行"),
+  },
+  { readOnlyHint: true },
+  async ({ path: filePath, mode, charCount, startLine, endLine }) => {
+    const result = readFileContent(filePath);
+    if (!result.ok) {
+      return { content: [{ type: "text", text: "❌ " + result.error }], isError: true };
+    }
+    const content = result.content;
+    const totalChars = content.length;
+
+    if (mode === "chars") {
+      if (charCount === undefined) {
+        return { content: [{ type: "text", text: "❌ mode=chars 时必须提供 charCount 参数" }], isError: true };
+      }
+      const slice = content.slice(0, charCount);
+      const header = "📄 文件: " + filePath + "\n模式: 前 " + charCount + " 字符（共 " + totalChars + " 字符）\n";
+      const footer = charCount < totalChars ? "\n\n...(已截断，还有 " + (totalChars - charCount) + " 字符未显示)" : "";
+      return { content: [{ type: "text", text: header + "──────────────────────\n" + slice + footer }] };
+    }
+
+    // mode === "lines"
+    if (startLine === undefined) {
+      return { content: [{ type: "text", text: "❌ mode=lines 时必须提供 startLine 参数" }], isError: true };
+    }
+    const lines = content.split(/\r?\n/);
+    const totalLines = lines.length;
+    const sLine = startLine;
+    const eLine = endLine !== undefined ? endLine : startLine;
+    if (eLine < sLine) {
+      return { content: [{ type: "text", text: "❌ endLine 不能小于 startLine" }], isError: true };
+    }
+    // 行号从1开始，数组索引从0开始
+    const startIdx = Math.max(0, sLine - 1);
+    const endIdx = Math.min(totalLines, eLine); // slice 不含 endIdx，所以用 eLine（因为已经 +1 偏移）
+    const selected = lines.slice(startIdx, endIdx);
+    // 为每行添加行号前缀
+    const numbered = selected.map((line, i) => {
+      const lineNo = startIdx + i + 1;
+      return String(lineNo).padStart(6, " ") + " | " + line;
+    });
+    const actualStart = startIdx + 1;
+    const actualEnd = startIdx + selected.length;
+    const header = "📄 文件: " + filePath + "\n模式: 第 " + actualStart + " - " + actualEnd + " 行（共 " + totalLines + " 行）\n";
+    const footer = eLine > totalLines ? "\n\n⚠️ 请求的结束行 " + eLine + " 超出文件总行数 " + totalLines + "，已自动截断" : "";
+    return { content: [{ type: "text", text: header + "──────────────────────\n" + numbered.join("\n") + footer }] };
   }
 );
 
