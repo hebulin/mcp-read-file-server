@@ -7,7 +7,7 @@
 ## 适用场景
 
 电脑安装了文件加密软件（如天锐绿盾、IP-Guard、亿赛通、深信服等），磁盘上的文件是密文。AI Agent（Claude Code、Cursor、Windsurf、Cline 等）是独立进程，内置文件工具不在白名单内，只能读到密文。而 Node.js 进程在白名单内，通过 MCP Server 提供的替代工具可以正常读写明文。
-[![MCP Badge](https://lobehub.com/badge/mcp/hebulin-mcp-read-file-server)](https://lobehub.com/mcp/hebulin-mcp-read-file-server)
+
 
 **前提条件：Node.js 进程已被加密软件列为白名单（受信任进程）。**
 
