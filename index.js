@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 /**
  * MCP Server: 文件操作工具集（加密软件环境明文读写）
  *
@@ -26,7 +27,9 @@ const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
 const { z } = require("zod");
 
-const server = new McpServer({ name: "read-file-server", version: "1.0.0" });
+// 版本号读取自 package.json，与发布版本保持同步，避免硬编码漂移
+const pkg = require("./package.json");
+const server = new McpServer({ name: "read-file-server", version: pkg.version });
 
 /**
  * 读取文件内容。Node.js 进程被加密软件列为白名单，fs.readFileSync 可自动解密读到明文。
