@@ -56,7 +56,7 @@ mcp-read-file-server/
 npx -y mcp-read-file-server
 ```
 
-首次运行 npx 会自动下载本包及其依赖到临时目录并启动。配置 Agent 时将 `command` 设为 `npx`、`args` 设为 `["-y", "mcp-read-file-server"]` 即可（见下文「配置」）。
+首次运行 npx 会自动下载本包及其依赖到临时目录并启动（需数秒~十几秒；若 Agent 启动超时，可先在终端手动跑一次 `npx -y mcp-read-file-server` 预热缓存，看到卡住等输入后 `Ctrl+C` 退出）。配置 Agent 时将 `command` 设为 `npx`、`args` 设为 `["-y", "mcp-read-file-server"]` 即可（见下文「配置」；**Windows 下部分 Agent 需用 `npx.cmd`**）。
 
 ### 方式二：从源码运行（开发 / 离线场景）
 
@@ -86,6 +86,21 @@ npm install
   }
 }
 ```
+
+> **⚠️ Windows 用户注意**：部分 Agent（Cursor / Cline / Continue 等）在 Windows 下直接用 `npx` 会启动失败（报 `spawn npx ENOENT` 或连不上），需把 `command` 改成 `npx.cmd`：
+>
+> ```json
+> {
+>   "mcpServers": {
+>     "read-file-server": {
+>       "command": "npx.cmd",
+>       "args": ["-y", "mcp-read-file-server"]
+>     }
+>   }
+> }
+> ```
+>
+> Claude Code 通常能自动识别 `npx`，无需改。若 `npx.cmd` 仍失败，可改用 `"command": "cmd"`、`"args": ["/c", "npx", "-y", "mcp-read-file-server"]`。
 
 ### 本地源码方式
 
@@ -287,3 +302,21 @@ cd mcp-read-file-server && npm install
 # 测试启动
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}' | node index.js
 ```
+
+### Agent 连不上 MCP Server
+
+包本身正常但 Agent 连不上时，按以下顺序排查：
+
+1. **Windows 下 `npx` 找不到**：部分 Agent（Cursor / Cline / Continue 等）需把 `command` 写成 `npx.cmd`，详见上文「配置 -> npx 方式」的 Windows 注意事项。这是 Windows 上最常见的连不上原因。
+2. **首次 npx 下载超时**：npx 首次拉取包需数秒~十几秒，某些 Agent 启动超时较短会连不上。先在终端手动跑一次 `npx -y mcp-read-file-server`（看到卡住等输入即启动成功，`Ctrl+C` 退出），让包进入缓存，再让 Agent 连接即可秒启。
+3. **npx 缓存了旧版 / 损坏**：清缓存重试 ——
+   ```bash
+   npx clear-npx-cache
+   # 或 Windows 下手动删除缓存目录
+   rm -rf "C:/Users/你的用户名/AppData/Local/npm-cache/_npx"
+   ```
+4. **确认包本身是否正常**：
+   ```bash
+   npx -y mcp-read-file-server   # 能启动=包没问题，问题在 Agent 配置/环境
+   ```
+   能启动并卡住等输入，说明包正常，需检查 Agent 的配置 JSON 格式与 `command` 写法。
