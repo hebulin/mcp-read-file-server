@@ -1,0 +1,5 @@
+# 可执行入口强制 LF 行尾：
+# shebang (#!/usr/bin/env node) 若带 \r（CRLF），在 Linux/macOS 下会被内核解析为
+# "/usr/bin/env node\r"，导致 npx 启动失败（env: node\r: No such file or directory）。
+# 本包需跨平台经 npx 运行，故此文件必须始终为 LF。
+index.js text eol=lf
