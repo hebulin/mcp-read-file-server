@@ -37,9 +37,11 @@ AI Agent  --(MCP/stdio)-->  Node.js MCP Server  --(fs.readFileSync)-->  读取�
 mcp-read-file-server/
 ├── README.md         # 本文档
 ├── SKILL.md          # 配套 Skill（可选，让 AI 学会自动选用本工具）
-├── index.js          # MCP Server 主程序（源代码）
-├── package.json      # 项目配置（依赖声明）
-└── node_modules/     # 依赖（@modelcontextprotocol/sdk、zod）
+├── index.js          # MCP Server 主程序（含 shebang，可作可执行入口）
+├── package.json      # 包配置（bin/files/依赖声明，可 npm publish）
+├── smithery.yaml     # Smithery 市场上架配置
+├── .gitignore        # Git 忽略规则
+└── node_modules/     # 依赖（@modelcontextprotocol/sdk、zod，不随包发布）
 ```
 
 ## 安装
@@ -48,16 +50,48 @@ mcp-read-file-server/
 - Node.js v18+（推荐 v20+）
 - Node.js 已被加密软件列为白名单进程
 
-### 安装依赖
+### 方式一：通过 npx 运行（推荐，无需手动安装）
+
+已发布到 npm，可直接通过 `npx` 运行，无需 `git clone` 和 `npm install`：
 
 ```bash
+npx -y mcp-read-file-server
+```
+
+首次运行 npx 会自动下载本包及其依赖到临时目录并启动。配置 Agent 时将 `command` 设为 `npx`、`args` 设为 `["-y", "mcp-read-file-server"]` 即可（见下文「配置」）。
+
+### 方式二：从源码运行（开发 / 离线场景）
+
+```bash
+git clone https://github.com/hebulin/mcp-read-file-server.git
 cd mcp-read-file-server
 npm install
 ```
 
+此时配置中使用 `node` + 本地 `index.js` 绝对路径。
+
 ## 配置
 
-所有 Agent 配置 MCP Server 的核心信息相同，只是配置文件位置和格式略有差异：
+所有 Agent 配置 MCP Server 的核心信息相同，只是配置文件位置和格式略有差异。
+
+### npx 方式（推荐）
+
+通过 npm 包运行，无需关心本地路径：
+
+```json
+{
+  "mcpServers": {
+    "read-file-server": {
+      "command": "npx",
+      "args": ["-y", "mcp-read-file-server"]
+    }
+  }
+}
+```
+
+### 本地源码方式
+
+若用「方式二」从源码运行，则指向本地 `index.js`：
 
 ```json
 {
@@ -80,8 +114,8 @@ npm install
 {
   "mcpServers": {
     "read-file-server": {
-      "command": "node",
-      "args": ["D:/AiJiamiToolsPlugins/mcp-read-file-server/index.js"]
+      "command": "npx",
+      "args": ["-y", "mcp-read-file-server"]
     }
   }
 }
@@ -90,14 +124,14 @@ npm install
 #### 方式二：全局配置（所有项目可用）
 
 ```bash
-claude mcp add read-file-server -s user -- node "D:/AiJiamiToolsPlugins/mcp-read-file-server/index.js"
+claude mcp add read-file-server -s user -- npx -y mcp-read-file-server
 ```
 
 参数说明：
 - `read-file-server`：MCP Server 名称（自定义）
 - `-s user`：作用域为全局（所有项目可用），不写则默认项目级
 - `--`：分隔符，后面是实际执行的命令
-- `node "..."`：实际执行的命令
+- `npx -y mcp-read-file-server`：实际执行的命令（自动从 npm 拉取并运行）
 
 #### 方式三：手动编辑全局配置文件
 
@@ -107,8 +141,8 @@ claude mcp add read-file-server -s user -- node "D:/AiJiamiToolsPlugins/mcp-read
 {
   "mcpServers": {
     "read-file-server": {
-      "command": "node",
-      "args": ["D:/AiJiamiToolsPlugins/mcp-read-file-server/index.js"]
+      "command": "npx",
+      "args": ["-y", "mcp-read-file-server"]
     }
   }
 }
@@ -233,13 +267,33 @@ cp SKILL.md ~/.openclaw/skills/encryption-file-ops/SKILL.md
 
 ## 在新电脑上使用
 
-只需拷贝 4 个文件：
-- `README.md`（本文档）
-- `SKILL.md`（配套 Skill，可选）
-- `index.js`（源代码）
-- `package.json`（依赖声明）
+已发布到 npm，新电脑上**无需拷贝文件**，只要装了 Node.js（v18+），直接配置 Agent 使用 `npx -y mcp-read-file-server` 即可。
 
-新电脑上运行 `npm install` 安装依赖，然后按目标 Agent 的方式配置 MCP 即可。
+> 若需离线使用或二次开发，再按「安装 -> 方式二」从源码克隆运行。
+
+## 上架 MCP 市场
+
+本包已具备 `npx` 直接运行能力，可上架到各 MCP 市场：
+
+| 市场 | 上架方式 |
+|------|---------|
+| npm | `npm publish`（包名 `mcp-read-file-server`，已配置 `bin` 与 `files`） |
+| Smithery | 在 https://smithery.ai 提交包名，仓库根已提供 `smithery.yaml`（上架前以官方文档核对） |
+| mcp.so | 在 https://mcp.so 提交 npm 包名与启动命令 `npx -y mcp-read-file-server` |
+| PulseMCP | 在 https://www.pulsemcp.com 提交包名 |
+
+发布到 npm 前建议本地预检：
+
+```bash
+# 预览将发布到 npm 的文件清单（应只有 index.js / README.md / SKILL.md / LICENSE / package.json）
+npm pack --dry-run
+
+# 登录并发布
+npm login
+npm publish
+```
+
+发布后，他人即可通过 `npx -y mcp-read-file-server` 一行命令运行，无需手动 `npm install`。
 
 ## 故障排查
 

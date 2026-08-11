@@ -1,0 +1,22 @@
+# 依赖（不提交，由 npm install 生成）
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+
+# 日志
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 构建产物
+dist/
+build/
+
+# 注意：package-lock.json 不忽略，需提交以保证可复现安装
