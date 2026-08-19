@@ -225,10 +225,12 @@ Windows 下文件多为 CRLF 换行，而 AI Agent 生成的多行 `oldString` �
 
 ### 其他内置保护
 
+- **预算读取（性能）**：`read_file` / `read_files` / `read_file_partial`(chars 模式) 只读取需要的字节数而非整个文件。读取 100MB 大文件的前 40 万字符从 ~160ms/100MB 内存降到 ~3ms/1.5MB 内存
+- **编码防损坏**：UTF-16 文件（BOM/字节特征检测）直接拒绝读取并提示转换；疑似非 UTF-8（GBK 等，含大量乱码替换字符）的文件 `edit_file` 拒绝编辑写回，防止不可逆损坏
 - **大文件截断**：`read_file` / `read_files` 单文件超过 40 万字符自动截断，提示改用 `read_file_partial` 分页读取，避免撑爆上下文
-- **二进制/超大文件跳过**：`search_files` 自动跳过图片、exe 等二进制文件（首 8KB 含 NUL 判定）与超过 5MB 的文件，并在结果中说明跳过数量
+- **二进制/超大文件跳过**：`search_files` 只预读首 8KB 判定二进制（图片/exe 含 NUL 字节）后即跳过，超过 5MB 的文件也跳过，并在结果中说明跳过数量
 - **隐藏文件默认跳过**：`search_files` / `find_files` 默认跳过 `.` 开头的文件与目录（避免把 `.env` 等敏感内容灌入上下文），忽略目录还包含 `node_modules`、`.git`、`target`、`build`、`dist`、`vendor` 等；`list_directory` 可用 `showHidden=true` 显示
-- **GBK 等非 UTF-8 文件暂不支持**：当前按 UTF-8 读写，GBK 文件会出现乱码，编辑写回会损坏数据（后续版本计划支持 encoding 参数）
+- **glob 支持 `{a,b}` 花括号**：`find_files` / `search_files` 的 include 支持 `src/**/*.{ts,tsx}` 这类 Agent 高频写法
 
 ## 使用
 

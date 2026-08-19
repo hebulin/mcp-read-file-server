@@ -44,32 +44,83 @@ const SCAN_MAX_BYTES = 5 * 1024 * 1024;
 const BINARY_SNIFF_BYTES = 8192;
 
 /**
- * 读取文件明文内容并做大文件与 BOM 处理。
- * - 超过 maxChars 时截断并置 truncated 标记，由调用方提示改用 read_file_partial
+ * 检测 buffer 是否为 UTF-16 文件（BOM FF FE / FE FF，或前若干字节呈现 NUL 交替特征）。
+ * 用于读工具拒绝按 UTF-8 处理 UTF-16 文件（静默乱码 + edit 写回即损坏）。
+ */
+function looksUtf16(buf) {
+  if (buf.length >= 2 && ((buf[0] === 0xff && buf[1] === 0xfe) || (buf[0] === 0xfe && buf[1] === 0xff))) return true;
+  // 无 BOM 启发式：ASCII 内容的 UTF-16LE 呈现「可打印字节与 NUL 交替」
+  const len = Math.min(buf.length, 256);
+  let pairs = 0, alt = 0;
+  for (let i = 0; i + 1 < len; i += 2) {
+    pairs++;
+    if ((buf[i] !== 0 && buf[i + 1] === 0) || (buf[i] === 0 && buf[i + 1] !== 0)) alt++;
+  }
+  return pairs >= 4 && alt / pairs > 0.8;
+}
+
+/**
+ * 检测 UTF-8 文本是否含大量替换字符（非法字节序列被解码的产物），
+ * 用于 edit_file 拒绝写回疑似非 UTF-8（GBK 等）内容，防止不可逆损坏。
+ */
+function isLikelyNonUtf8(text) {
+  if (text.length < 100) return false;
+  let bad = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) === 0xfffd) bad++;
+  }
+  return bad / text.length > 0.01; // >1% 替换字符即判定
+}
+
+/**
+ * 读取文件明文内容并做大文件与 BOM 处理（预算读取实现）。
+ * - maxChars 限制返回字符数：先按 UTF-8 最多 4 字节/字符的关系将预算换算为字节数，
+ *   只读需要的字节数；截断时用明文字节数报告真实体量，避免 readFileSync 全量载入
  * - 剥离 UTF-8 BOM 并记录，写回工具据此外决定是否补回，避免 oldString 匹配失败与 BOM 丢失
- * 返回 { ok, content, size, truncated, hasBom }，失败返回 { ok:false, error }。
+ * 返回 { ok, content, size, truncated, hasBom, totalChars }，失败返回 { ok:false, error }。
  */
 function readFileContent(filePath, maxChars) {
   try {
-    let content = fs.readFileSync(filePath, "utf-8");
-    // Node 的 utf-8 解码会把 BOM 保留为开头的 \uFEFF，必须剥离，否则：
-    // 1) 返回给 Agent 的文本带不可见前缀干扰匹配；2) edit_file 对首行的 oldString 两级匹配均失败
+    const limit = maxChars || Infinity;
+    // UTF-8 变长编码（1-4 字节/字符）：预算字节数 = 上限字符数 × 4，保证解码后至少有 limit 个字符。
+    // 预算同时兼作 UTF-16 嗅探（首字节特征），一次 IO 完成（无限制场景也先嗅 4KB）
+    const budgetBytes = limit === Infinity ? 4096 : limit * 4;
+    const pref = readFilePrefix(filePath, budgetBytes);
+    if (!pref.ok) return pref;
+    // UTF-16 防护：按 UTF-8 解码 UTF-16 文件会产生大量乱码，且 edit_file 写回会损坏
+    // 原文件。嗅探首块命中则直接拒绝并给出明确指引。
+    if (looksUtf16(pref.firstBytes)) {
+      return { ok: false, error: "文件疑似 UTF-16 编码（检测到 UTF-16 BOM 或字节特征），本工具仅支持 UTF-8，请先转换为 UTF-8 再操作: " + filePath };
+    }
+    let content = pref.text;
     const hasBom = content.charCodeAt(0) === 0xfeff;
     if (hasBom) content = content.slice(1);
-    // 加密环境下 stat.size 是密文字节数，与明文长度不一致，改用明文字节数避免误导
-    const size = Buffer.byteLength(content, "utf-8");
-    const limit = maxChars || Infinity;
-    if (content.length > limit) {
-      return {
-        ok: true,
-        content: content.slice(0, limit),
-        size,
-        truncated: true,
-        totalChars: content.length,
-        hasBom,
-      };
+    if (!pref.isTruncated) {
+      // 整个文件都在预算内：无截断。但字符数可能仍超 limit（预算按4字节/字符放大），
+      // 此时按 limit 截断字符（文件已全部读入，totalChars 可精确报告）
+      if (limit !== Infinity && content.length > limit) {
+        return { ok: true, content: content.slice(0, limit), size: Buffer.byteLength(content, "utf-8"), truncated: true, hasBom, totalChars: content.length };
+      }
+      const size = Buffer.byteLength(content, "utf-8");
+      return { ok: true, content, size, truncated: false, hasBom, totalChars: content.length };
     }
-    return { ok: true, content, size, truncated: false, hasBom };
+    if (limit === Infinity) {
+      // 无限制场景（edit_file 等）预算只是嗅探：文件超 4KB 需全量补读
+      content = content + fs.readFileSync(filePath, "utf-8").slice(content.length + (hasBom ? 1 : 0));
+      return { ok: true, content, size: Buffer.byteLength(content, "utf-8"), truncated: false, hasBom, totalChars: content.length };
+    }
+    // 预算内读满仍可能没读全文件：截断到 limit 字符。
+    // 预算按「最多4字节/字符」换算，正常文本截断点落在字符边界；若末字符恰为 U+FFFD，
+    // 说明字节边界被切断，回退一位丢弃半个字符（多字节 UTF-8 中合法 U+FFFD 极罕见，可接受）
+    let end = limit;
+    if (end < content.length) {
+      const code = content.charCodeAt(end - 1);
+      if (code >= 0xd800 && code <= 0xdbff) end++; // 代理对保护
+      else if (code === 0xfffd) end = Math.max(1, end - 1);
+    }
+    content = content.slice(0, end);
+    // 明文总字节数：stat.size 是密文字节数不可用；截断场景用已读字节数做下界估计
+    return { ok: true, content, size: pref.bytesRead, truncated: true, hasBom, totalChars: null, bytesRead: pref.bytesRead };
   } catch (e) {
     if (e.code === "ENOENT") {
       return { ok: false, error: "文件不存在: " + filePath };
@@ -82,22 +133,42 @@ function readFileContent(filePath, maxChars) {
 }
 
 /**
- * 将 glob 模式编译为正则：支持 *（不含路径分隔符）、**（跨目录任意字符）、?（单字符）。
- * 统一使用 / 作为路径分隔符（匹配前已把 Windows 的 \ 归一），与 Agent 的 glob 习惯一致。
+ * 将 glob 模式编译为正则：支持 *（不含路径分隔符）、**（跨目录任意字符）、?（单字符）、
+ * {a,b} 花括号展开（如 *.{ts,tsx}）。统一使用 / 作为路径分隔符（匹配前已把
+ * Windows 的 \ 归一），与 Agent 的 glob 习惯一致。
  */
 function globToRegex(glob) {
+  // 先展开花括号 {a,b} -> (a|b)，支持一层嵌套场景（**/{src,test}/** 等）
+  let expanded = glob;
+  const brace = /\{([^{}]*,[^{}]*)\}/;
+  let guard = 0;
+  while (brace.test(expanded) && guard++ < 10) {
+    expanded = expanded.replace(brace, (_m, inner) => "(" + inner.split(",").map((s) => s.trim()).join("|") + ")");
+  }
   let re = "";
-  for (let i = 0; i < glob.length; i++) {
-    const ch = glob[i];
+  for (let i = 0; i < expanded.length; i++) {
+    const ch = expanded[i];
     if (ch === "*") {
-      if (glob[i + 1] === "*") {
+      if (expanded[i + 1] === "*") {
         // ** 跨目录任意匹配（连同后随的 / 一并吞掉，避免空段）
         re += ".*";
         i++;
-        if (glob[i + 1] === "/") i++;
+        if (expanded[i + 1] === "/") i++;
       } else {
         // * 不跨目录
         re += "[^/]*";
+      }
+    } else if (ch === "(") {
+      // 花括号展开产生的分组 (a|b)：整段原样保留到闭括号，跳过其中字符的转义
+      const close = expanded.indexOf(")", i);
+      if (close === -1) {
+        re += "\\(";
+      } else {
+        // 组内允许含 * 与 ? 通配，递归编译组内每个分支后重组
+        const inner = expanded.slice(i + 1, close);
+        const branches = inner.split("|").map((b) => globToRegex(b).source.replace(/^\^|\$$/g, ""));
+        re += "(" + branches.join("|") + ")";
+        i = close;
       }
     } else if (ch === "?") {
       re += "[^/]";
@@ -121,6 +192,44 @@ function isBinaryBuffer(buf) {
   return false;
 }
 
+/**
+ * 预算读取：只读文件前 budgetBytes 字节并按 UTF-8 增量解码。
+ * 用于大文件截断与二进制嗅探场景，避免 readFileSync 全量载入（读 1GB 文件
+ * 只为返回前 40 万字符的内存浪费）。解码在字节边界截断时，截断的末字符
+ * 会退化为 U+FFFD，因此调用方必须显式传入 isTruncated 判定（截断才可信）。
+ * 返回 { ok, text, bytesRead, isTruncated, firstBytes }，失败返回 { ok:false, error }。
+ */
+function readFilePrefix(filePath, budgetBytes) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, "r");
+    const chunks = [];
+    let total = 0;
+    const chunk = Buffer.allocUnsafe(Math.min(budgetBytes, 1024 * 1024));
+    while (total < budgetBytes) {
+      const want = Math.min(chunk.length, budgetBytes - total);
+      const n = fs.readSync(fd, chunk, 0, want, null);
+      if (n <= 0) break;
+      chunks.push(Buffer.from(chunk.subarray(0, n)));
+      total += n;
+    }
+    const buf = Buffer.concat(chunks);
+    return {
+      ok: true,
+      text: buf.toString("utf-8"),
+      bytesRead: total,
+      isTruncated: total >= budgetBytes,
+      firstBytes: buf,
+    };
+  } catch (e) {
+    if (e.code === "ENOENT") return { ok: false, error: "文件不存在: " + filePath };
+    if (e.code === "EISDIR") return { ok: false, error: "路径是目录而非文件: " + filePath };
+    return { ok: false, error: "读取失败（可能是密文，请确认 Node.js 是否被加密软件列为白名单进程）: " + e.message };
+  } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch (e) { /* 忽略关闭失败 */ } }
+  }
+}
+
 // 注册 read_file 工具
 server.tool(
   "read_file",
@@ -132,7 +241,8 @@ server.tool(
     if (result.ok) {
       let text = result.content;
       if (result.truncated) {
-        text += "\n\n⚠️ 文件共 " + result.totalChars + " 字符，已截断为前 " + result.content.length + " 字符。请改用 read_file_partial 分页读取后续内容。";
+        // 截断时 totalChars 不可得（避免为报总数而全量读取），用已读明文字节数描述体量
+        text += "\n\n⚠️ 文件较大，已截断为前 " + result.content.length + " 字符（至少 " + result.bytesRead + " 字节）。请改用 read_file_partial 分页读取后续内容。";
       }
       return { content: [{ type: "text", text }] };
     } else {
@@ -165,7 +275,7 @@ server.tool(
         okCount++;
         let body = result.content;
         if (result.truncated) {
-          body += "\n\n⚠️ [单文件已截断，共 " + result.totalChars + " 字符，如需后续内容请用 read_file_partial]";
+          body += "\n\n⚠️ [单文件已截断为前 " + result.content.length + " 字符，如需后续内容请用 read_file_partial]";
         }
         results.push("========== 文件: " + p + " ==========\n" + body);
       } else {
@@ -194,26 +304,36 @@ server.tool(
   },
   { readOnlyHint: true },
   async ({ path: filePath, mode, charCount, startLine, endLine }) => {
-    const result = readFileContent(filePath);
+    // chars 模式走预算读取（只读需要的字节），lines 模式需完整行结构仍全量读
+    const result = mode === "chars"
+      ? (charCount === undefined
+          ? null
+          : readFileContent(filePath, charCount))
+      : readFileContent(filePath);
+    if (mode === "chars" && result === null) {
+      return { content: [{ type: "text", text: "❌ mode=chars 时必须提供 charCount 参数" }], isError: true };
+    }
     if (!result.ok) {
       return { content: [{ type: "text", text: "❌ " + result.error }], isError: true };
     }
     const content = result.content;
-    const totalChars = content.length;
+    // chars 模式下预算读取可能已截断在 charCount 处，此时 totalChars 不可知，
+    // 报告为「至少」；未截断（文件小于预算）则精确
+    const totalChars = mode === "chars" && result.truncated ? null : result.totalChars;
+    const totalCharsText = totalChars === null ? "≥" + content.length : String(totalChars);
 
     if (mode === "chars") {
-      if (charCount === undefined) {
-        return { content: [{ type: "text", text: "❌ mode=chars 时必须提供 charCount 参数" }], isError: true };
-      }
       let end = charCount;
       // 避免把代理对（emoji/生僻字）切成两半产生孤立代理项乱码：落在高位代理上时右移一位
-      if (end < totalChars) {
+      if (end < content.length) {
         const code = content.charCodeAt(end - 1);
         if (code >= 0xd800 && code <= 0xdbff) end++;
       }
       const slice = content.slice(0, end);
-      const header = "📄 文件: " + filePath + "\n模式: 前 " + charCount + " 字符（共 " + totalChars + " 字符）\n";
-      const footer = end < totalChars ? "\n\n...(已截断，还有 " + (totalChars - end) + " 字符未显示)" : "";
+      const header = "📄 文件: " + filePath + "\n模式: 前 " + charCount + " 字符（共 " + totalCharsText + " 字符）\n";
+      const footer = end < content.length || result.truncated
+        ? "\n\n...(已截断，还有内容未显示，可用更大的 charCount 继续读取)"
+        : "";
       return { content: [{ type: "text", text: header + "──────────────────────\n" + slice + footer }] };
     }
 
@@ -265,17 +385,17 @@ server.tool(
     try {
       const writeMode = mode === "append" ? "append" : "overwrite";
       let finalContent = content;
-      let existed = false;
-      if (writeMode === "overwrite" && fs.existsSync(filePath)) {
-        // 覆盖已有文件：读取原内容以继承 BOM 与主导行尾风格
-        existed = true;
+      // 覆盖/追加已有文件时：读取原文件元信息（BOM 与主导行尾）做适配，
+      // 单次 readFileContent(prefix 4KB 嗅探 + 全量) 避免重复 IO
+      if (fs.existsSync(filePath)) {
         const prev = readFileContent(filePath);
         if (prev.ok) {
-          if (prev.hasBom) finalContent = "\uFEFF" + finalContent;
+          if (writeMode === "overwrite" && prev.hasBom) finalContent = "\uFEFF" + finalContent;
           if (eol !== "lf" && eol !== "crlf") {
-            // eol=auto：新内容行尾跟随原文件主导风格，避免 CRLF 文件被写成 LF 混行
+            // eol=auto（默认）：内容行尾跟随原文件主导风格（双向转换），
+            // 避免 CRLF 文件被追加 LF 内容或 LF 文件被写入 CRLF 内容产生混行
             const prevEol = detectEol(prev.content);
-            if (prevEol === "\r\n") finalContent = normalizeEol(finalContent, "\r\n");
+            finalContent = normalizeEol(finalContent, prevEol);
           }
         }
       }
@@ -376,6 +496,14 @@ server.tool(
       }
       const original = readResult.content;
       const hasBom = readResult.hasBom;
+      // 非 UTF-8 防护：GBK 等编码按 UTF-8 读入会产生大量 U+FFFD，此时做任何替换再写回，
+      // 原始字节信息会永久丢失（不可逆损坏）。检测到即拒绝编辑并明确提示。
+      if (isLikelyNonUtf8(original)) {
+        return {
+          content: [{ type: "text", text: "❌ 文件疑似非 UTF-8 编码（GBK 等），按 UTF-8 读取出现大量乱码替换字符，继续编辑写回会不可逆损坏文件，已拒绝操作: " + filePath + "\n建议：先确认文件编码，转换为 UTF-8 后再编辑。" }],
+          isError: true,
+        };
+      }
       // 文件主导换行风格：CRLF 文件写入的替换文本也转成 CRLF，保持文件风格统一
       const fileEol = detectEol(original);
       const normalizedNew = normalizeEol(newString, fileEol);
@@ -520,10 +648,17 @@ server.tool(
         if (size > SCAN_MAX_BYTES) { skippedLarge++; return; }
         let content;
         try {
-          // 先按 buffer 读以嗅探二进制（图片/exe/dll 含 NUL 字节），避免整读后才发现
-          const buf = fs.readFileSync(full);
-          if (isBinaryBuffer(buf)) { skippedBinary++; return; }
-          content = buf.toString("utf-8");
+          // 真首块嗅探：只读前 8KB 判二进制，避免为嗅探而整读大文件
+          const sniff = readFilePrefix(full, BINARY_SNIFF_BYTES);
+          if (!sniff.ok) return;
+          if (isBinaryBuffer(sniff.firstBytes)) { skippedBinary++; return; }
+          if (sniff.isTruncated) {
+            // 文件大于嗅探预算：余量部分整体读取后拼接（5MB 上限保证内存可控）
+            content = sniff.text + fs.readFileSync(full, "utf-8").slice(sniff.text.length);
+          } else {
+            // 文件整体在预算内：首块即全文，避免第二次 IO
+            content = sniff.text;
+          }
         } catch (e) {
           return;
         }
@@ -657,8 +792,10 @@ server.tool(
         ...(isSymlink ? { symlinkTarget: fs.readlinkSync(filePath), targetType: targetInfo } : {}),
         // 密文字节数：加密环境下的磁盘占用，与明文大小不一致
         sizeOnDisk: stat.size,
-        // 明文字节数：仅文件场景提供，读取内容后统计（目录返回 null）
-        sizePlaintext: !isSymlink && !lstat.isDirectory() ? Buffer.byteLength(readFileContent(filePath).content || "", "utf-8") : null,
+        // 明文字节数：仅普通文件场景提供；读取失败（非 UTF-16 拒绝/权限等）置 null 而非误导性的 0
+        sizePlaintext: !isSymlink && !lstat.isDirectory()
+          ? (() => { const r = readFileContent(filePath); return r.ok ? r.size : null; })()
+          : null,
         modifiedTime: stat.mtime.toISOString(),
         createdTime: stat.birthtime.toISOString(),
       };
@@ -826,14 +963,33 @@ server.tool(
   },
   async ({ source, destination }) => {
     try {
-      const srcStat = fs.statSync(source);
-      const destExists = fs.existsSync(destination);
+      // 单次 stat 消除 existsSync+statSync 双调用的竞态窗口
+      let srcStat;
+      try {
+        srcStat = fs.statSync(source);
+      } catch (e) {
+        if (e.code === "ENOENT") {
+          return { content: [{ type: "text", text: "❌ 源路径不存在: " + source }], isError: true };
+        }
+        throw e;
+      }
       // 目标为已存在目录时，将源合并/放入目标目录下（与 bash cp 的自然预期一致）
       let finalDest = destination;
-      if (destExists && fs.statSync(destination).isDirectory() && path.basename(source)) {
+      let destDirStat = null;
+      try {
+        destDirStat = fs.statSync(destination);
+      } catch (e) {
+        if (e.code !== "ENOENT") throw e;
+      }
+      if (destDirStat && destDirStat.isDirectory() && path.basename(source)) {
         finalDest = path.join(destination, path.basename(source));
       }
-      const destStat = fs.existsSync(finalDest) ? fs.statSync(finalDest) : null;
+      let destStat = null;
+      try {
+        destStat = fs.statSync(finalDest);
+      } catch (e) {
+        if (e.code !== "ENOENT") throw e;
+      }
       // 类型冲突检查：文件 -> 已有目录 或 目录 -> 已有文件，均直接报错避免误操作
       if (srcStat.isFile() && destStat && destStat.isDirectory()) {
         return { content: [{ type: "text", text: "❌ 无法复制：源是文件但目标是已存在的目录: " + finalDest }], isError: true };
@@ -844,9 +1000,6 @@ server.tool(
       fs.cpSync(source, finalDest, { recursive: srcStat.isDirectory(), force: true });
       return { content: [{ type: "text", text: "✅ 复制成功: " + source + " -> " + finalDest + (srcStat.isDirectory() ? "（递归目录）" : "") }] };
     } catch (e) {
-      if (e.code === "ENOENT") {
-        return { content: [{ type: "text", text: "❌ 源路径不存在: " + source }], isError: true };
-      }
       return { content: [{ type: "text", text: "❌ 复制失败: " + e.message }], isError: true };
     }
   }
@@ -862,11 +1015,23 @@ server.tool(
   },
   async ({ source, destination }) => {
     try {
-      const srcStat = fs.statSync(source);
+      // 单次 stat 消除双调用竞态
+      let srcStat;
+      try {
+        srcStat = fs.statSync(source);
+      } catch (e) {
+        if (e.code === "ENOENT") {
+          return { content: [{ type: "text", text: "❌ 源路径不存在: " + source }], isError: true };
+        }
+        throw e;
+      }
       let finalDest = destination;
       // 目标为已存在目录时移入其下（与 bash mv 预期一致）
-      if (fs.existsSync(destination) && fs.statSync(destination).isDirectory()) {
-        finalDest = path.join(destination, path.basename(source));
+      try {
+        const st = fs.statSync(destination);
+        if (st.isDirectory()) finalDest = path.join(destination, path.basename(source));
+      } catch (e) {
+        if (e.code !== "ENOENT") throw e;
       }
       try {
         fs.renameSync(source, finalDest);

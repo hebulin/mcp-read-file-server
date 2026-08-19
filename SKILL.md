@@ -154,7 +154,8 @@ description: 在文件加密软件（天锐绿盾 / IP-Guard / 亿赛通 / 深�
 | 读到的还是密文/乱码 | Node.js 不在加密软件白名单 | 联系管理员把 `node.exe` 加入白名单 |
 | `mcp__read-file-server__*` 工具全部不可见 | MCP Server 未配置或未启动 | 见 `README.md` 配置 `.mcp.json` |
 | `edit_file` 报"未找到匹配内容" | `oldString` 拼写、缩进不对（换行 CRLF/LF 差异与 BOM 已自动兼容） | 重新 `read_file` 复制原文，**不要凭记忆写**；重点检查空格与缩进 |
-| 读取 GBK 等非 UTF-8 文件乱码 | 当前仅支持 UTF-8 | 暂不支持，避免对非 UTF-8 文件做编辑写回（会损坏数据） |
+| 读取被拒：文件疑似 UTF-16 | 工具仅支持 UTF-8 | 先转换为 UTF-8 再操作（防乱码与写回损坏） |
+| `edit_file` 拒绝编辑：疑似非 UTF-8（GBK 等） | 按 UTF-8 读出大量乱码替换字符 | 继续写回会不可逆损坏文件；先转码再编辑 |
 | 大文件读取不完整 | 超过 40 万字符自动截断 | 用 `read_file_partial` 分页读取 |
 | `search_files` 搜不到某些文件 | 二进制/超大(>5MB)文件被跳过，或隐藏文件/忽略目录被排除 | 看返回尾部的跳过统计；必要时用 `include` 限定范围 |
 | `edit_file` 报"匹配到 N 处" | 文件中存在重复内容 | 加更长/更唯一的 `oldString` 唯一定位，或 `replaceAll=true` |
