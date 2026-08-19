@@ -182,7 +182,7 @@ claude mcp list
 | `read_files` | 多次 Read | 批量读取多个文件明文 | `paths`: 逗号分隔的路径 |
 | `read_file_partial` | Read（局部） | 局部读取文件（前N字符 / 指定行范围） | `path`、`mode`、`charCount`、`startLine`、`endLine` |
 | `write_file` | Write | 写入文件（自动加密落盘） | `path`、`content` |
-| `edit_file` | Edit/MultiEdit | 精确字符串/正则替换后写回 | `path`、`oldString`、`newString`、`useRegex`、`replaceAll`、`ignoreCase` |
+| `edit_file` | Edit/MultiEdit | 精确字符串/正则替换后写回（自动兼容 CRLF/LF 换行差异） | `path`、`oldString`、`newString`、`useRegex`、`replaceAll`、`ignoreCase` |
 | `search_files` | Grep | 递归搜索文件内容 | `pattern`、`path`、`include`、`ignoreCase`、`onlyMatching`、`maxResults` |
 | `create_directory` | - | 递归创建目录 | `path` |
 | `file_info` | - | 查询文件/目录信息 | `path` |
@@ -205,6 +205,16 @@ claude mcp list
 - 读取第 5-20 行：`mode="lines"`, `startLine=5`, `endLine=20`
 
 > 返回内容会带文件名、读取范围、总字符数/总行数的头部信息，行模式下每行带行号前缀。超出文件范围时自动截断并提示。
+
+### `edit_file` 换行符自动兼容
+
+Windows 下文件多为 CRLF 换行，而 AI Agent 生成的多行 `oldString` 通常是 LF 换行，字节级比对会直接失败（报"未找到匹配内容"）。本工具已内置兼容逻辑：
+
+- **匹配阶段**：先按字节原样精确匹配；未命中时自动将文件与 `oldString` 的换行符统一归一（`\r\n` / `\r` / `\n` 均视为换行）后再匹配，两种风格任意组合均可命中
+- **写入阶段**：`newString` 的行尾会自动转换为文件本身的主导换行风格，不会把 CRLF 文件改写为 LF 混行
+- **提示信息**：触发换行适配时，返回结果会附 `ℹ️ 换行符已自动适配` 说明，方便排查
+
+注意：该兼容仅针对换行符差异，空格、缩进等其他空白字符仍需与原文完全一致。
 
 ## 使用
 

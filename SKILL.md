@@ -81,7 +81,7 @@ description: 在文件加密软件（天锐绿盾 / IP-Guard / 亿赛通 / 深�
 1. mcp__read-file-server__read_file 读取明文
 2. 分析内容
 3. mcp__read-file-server__edit_file 修改
-   - oldString 必须从第 1 步读到的内容里**原样复制**（含空格、缩进、换行）
+   - oldString 必须从第 1 步读到的内容里**原样复制**（含空格、缩进；换行风格差异会自动兼容）
 4. 必要时再 read_file 验证修改结果
 ```
 
@@ -132,7 +132,7 @@ description: 在文件加密软件（天锐绿盾 / IP-Guard / 亿赛通 / 深�
 
 1. **路径**：用**绝对路径**最稳（如 `D:/AiJiamiToolsPlugins/...`），相对路径以 MCP Server 启动目录为基准
 2. **`edit_file` 前必读**：必须先 `read_file` 拿到明文，再从原文里**原样复制** `oldString`，否则会因为空格/缩进不匹配而失败
-3. **不要在 `oldString` 里漏换行**：多行替换时，行末换行符也要复制完整
+3. **换行风格无需担心**：文件是 CRLF 而 `oldString` 是 LF（或相反）时，`edit_file` 会自动归一换行后匹配；`newString` 行尾也会自动跟随文件主导风格，不会产生混行
 4. **`write_file` 是覆盖写**：会清空原文件再写入，重要文件修改前建议先 `read_file` 备份内容
 5. **`search_files` 自动跳过**：`node_modules`、`.git`、`target`、`build`、`dist`、`.idea`、`.vscode`
 6. **大批量搜索**：用 `maxResults` 控制返回数量，避免一次性返回过多结果
@@ -146,7 +146,7 @@ description: 在文件加密软件（天锐绿盾 / IP-Guard / 亿赛通 / 深�
 |------|----------|----------|
 | 读到的还是密文/乱码 | Node.js 不在加密软件白名单 | 联系管理员把 `node.exe` 加入白名单 |
 | `mcp__read-file-server__*` 工具全部不可见 | MCP Server 未配置或未启动 | 见 `README.md` 配置 `.mcp.json` |
-| `edit_file` 报"未找到匹配内容" | `oldString` 拼写、缩进、换行不对 | 重新 `read_file` 复制原文，**不要凭记忆写** |
+| `edit_file` 报"未找到匹配内容" | `oldString` 拼写、缩进不对（换行 CRLF/LF 差异已自动兼容） | 重新 `read_file` 复制原文，**不要凭记忆写**；重点检查空格与缩进 |
 | `edit_file` 报"匹配到 N 处" | 文件中存在重复内容 | 加更长/更唯一的 `oldString` 唯一定位，或 `replaceAll=true` |
 | `search_files` 报"正则表达式无效" | 正则语法错误 | 检查 `pattern` 是否需要转义特殊字符 |
 | `write_file` 报权限错误 | 文件被占用或目录无写权限 | 关闭占用进程 / 检查目录权限 |

@@ -168,10 +168,71 @@ server.tool(
   }
 );
 
+/**
+ * 检测文本的主导换行风格：CRLF 数量多于孤立 LF 时返回 "\r\n"，否则返回 "\n"。
+ */
+function detectEol(text) {
+  const crlf = (text.match(/\r\n/g) || []).length;
+  const lf = (text.match(/\n/g) || []).length - crlf;
+  return crlf > lf ? "\r\n" : "\n";
+}
+
+/**
+ * 将文本换行符统一为目标风格 eol（先归一为 \n 再输出，避免 CRLF 被二次转换）。
+ */
+function normalizeEol(text, eol) {
+  return text.replace(/\r\n?/g, "\n").replace(/\n/g, eol);
+}
+
+/**
+ * 换行符不敏感的替换兜底：文件为 CRLF 而 oldString 为 LF（或相反）时仍可命中。
+ * 原理：把原文与 oldString 的换行均归一为 \n 后匹配，并用索引映射表把命中位置
+ * 换算回原文位置，未命中区域逐字节保持原样；replacement 由调用方预先按文件
+ * 主导换行风格归一。返回 { updated, count }，无命中返回 null。
+ */
+function eolInsensitiveReplace(original, oldString, replacement, replaceAll, ignoreCase) {
+  const parts = [];
+  const map = [];
+  for (let i = 0; i < original.length; i++) {
+    if (original.charCodeAt(i) === 13) {
+      // \r 与 \r\n 均折叠为一个 \n，并记录该换行在原文中的起点
+      parts.push("\n");
+      map.push(i);
+      if (original.charCodeAt(i + 1) === 10) i++;
+    } else {
+      parts.push(original[i]);
+      map.push(i);
+    }
+  }
+  map.push(original.length);
+  const norm = parts.join("");
+  const normNeedle = oldString.replace(/\r\n?/g, "\n");
+  if (!normNeedle) return null;
+  const hay = ignoreCase ? norm.toLowerCase() : norm;
+  const needle = ignoreCase ? normNeedle.toLowerCase() : normNeedle;
+  const positions = [];
+  let idx = 0;
+  while ((idx = hay.indexOf(needle, idx)) !== -1) {
+    positions.push(idx);
+    idx += needle.length;
+  }
+  if (!positions.length) return null;
+  let updated = original;
+  // 从后往前替换，避免前面的替换使后面的原始索引失效
+  const targets = replaceAll ? positions : [positions[0]];
+  for (let i = targets.length - 1; i >= 0; i--) {
+    const p = targets[i];
+    const start = map[p];
+    const end = map[p + normNeedle.length];
+    updated = updated.slice(0, start) + replacement + updated.slice(end);
+  }
+  return { updated, count: positions.length };
+}
+
 // 注册 edit_file 工具（精确替换，替代受加密影响的 Edit/MultiEdit）
 server.tool(
   "edit_file",
-  "对文件内容做精确字符串或正则替换后写回（明文）。加密软件环境下内置 Edit/MultiEdit 直写会破坏加密，本工具用 Node.js fs 读改写，自动加密落盘。替代内置 Edit/MultiEdit 工具。",
+  "对文件内容做精确字符串或正则替换后写回（明文）。字符串匹配自动兼容 CRLF/LF 换行差异，替换文本行尾自动跟随文件主导风格。加密软件环境下内置 Edit/MultiEdit 直写会破坏加密，本工具用 Node.js fs 读改写，自动加密落盘。替代内置 Edit/MultiEdit 工具。",
   {
     path: z.string().describe("文件路径，支持相对路径或绝对路径"),
     oldString: z.string().describe("要被替换的原字符串。useRegex=true 时作为正则表达式"),
@@ -183,6 +244,9 @@ server.tool(
   async ({ path: filePath, oldString, newString, useRegex, replaceAll, ignoreCase }) => {
     try {
       const original = fs.readFileSync(filePath, "utf-8");
+      // 文件主导换行风格：CRLF 文件写入的替换文本也转成 CRLF，保持文件风格统一
+      const fileEol = detectEol(original);
+      const normalizedNew = normalizeEol(newString, fileEol);
       let matcher;
       if (useRegex) {
         try {
@@ -194,42 +258,58 @@ server.tool(
       }
       let count;
       let updated;
+      let eolAdapted = false; // 是否触发了换行符兼容替换
       if (useRegex) {
         const globalMatcher = new RegExp(matcher.source, "g" + (ignoreCase ? "i" : ""));
         const matches = original.match(globalMatcher);
         count = matches ? matches.length : 0;
         const replaceMatcher = replaceAll ? globalMatcher : new RegExp(matcher.source, ignoreCase ? "i" : "");
-        updated = original.replace(replaceMatcher, newString);
+        updated = original.replace(replaceMatcher, normalizedNew);
       } else {
         if (oldString === "") {
           return { content: [{ type: "text", text: "❌ oldString 不能为空字符串" }], isError: true };
         }
+        // 第一优先：原样精确匹配（字节级一致，最安全）
         let idx = 0, c = 0;
         const hay = ignoreCase ? original.toLowerCase() : original;
         const needle = ignoreCase ? oldString.toLowerCase() : oldString;
         while ((idx = hay.indexOf(needle, idx)) !== -1) { c++; idx += needle.length; }
         count = c;
-        if (replaceAll) {
-          const esc = oldString.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-          updated = original.replace(new RegExp(esc, ignoreCase ? "gi" : "g"), newString);
-        } else {
-          const pos = ignoreCase ? hay.indexOf(needle) : original.indexOf(oldString);
-          if (pos === -1) {
-            updated = original;
+        if (count > 0) {
+          if (replaceAll) {
+            const esc = oldString.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            // 用函数替换避免 newString 中的 $& $1 等被误解析为替换模式
+            updated = original.replace(new RegExp(esc, ignoreCase ? "gi" : "g"), () => normalizedNew);
           } else {
-            updated = original.slice(0, pos) + newString + original.slice(pos + oldString.length);
+            const pos = hay.indexOf(needle);
+            updated = original.slice(0, pos) + normalizedNew + original.slice(pos + oldString.length);
+          }
+        } else {
+          // 第二优先：换行符兼容匹配。文件是 CRLF 而 oldString 用 LF（或相反）时，
+          // 字节级比对必然失败，这里归一换行后再匹配，命中即记为换行适配替换
+          const adapted = eolInsensitiveReplace(original, oldString, normalizedNew, replaceAll, ignoreCase);
+          if (adapted) {
+            count = adapted.count;
+            updated = adapted.updated;
+            eolAdapted = true;
+          } else {
+            count = 0;
+            updated = original;
           }
         }
       }
       if (count === 0) {
         return {
-          content: [{ type: "text", text: "⚠️ 未找到匹配内容，文件未修改。请检查 oldString（或正则）是否正确: " + filePath }],
+          content: [{ type: "text", text: "⚠️ 未找到匹配内容，文件未修改。请检查 oldString（或正则）是否正确: " + filePath + "\n提示：若内容本身无误，请确认文件与 oldString 的换行风格（CRLF/LF）及空白字符是否一致。" }],
           isError: true,
         };
       }
       let warning = "";
+      if (eolAdapted) {
+        warning = "\nℹ️ 换行符已自动适配：oldString 与文件换行风格不一致（CRLF/LF），已按换行归一化匹配完成替换。";
+      }
       if (!replaceAll && count > 1) {
-        warning = "\n⚠️ 注意：共匹配 " + count + " 处，但 replaceAll=false 仅替换了第一处。如需全部替换请设 replaceAll=true。";
+        warning += "\n⚠️ 注意：共匹配 " + count + " 处，但 replaceAll=false 仅替换了第一处。如需全部替换请设 replaceAll=true。";
       }
       if (updated === original) {
         return { content: [{ type: "text", text: "⚠️ 替换后内容无变化，文件未修改: " + filePath }] };
