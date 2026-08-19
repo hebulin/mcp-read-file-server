@@ -11,15 +11,20 @@
  * 适用于任何「Node.js 是加密软件白名单进程」的场景。
  *
  * 提供工具：
- *   - read_file          读取单个文件明文（替代内置 Read）
+ *   - read_file          读取单个文件明文（替代内置 Read，大文件自动截断）
  *   - read_files         批量读取多个文件明文
  *   - read_file_partial  局部读取文件（前N字符 / 指定行范围）
- *   - write_file         写入文件，自动加密落盘（替代内置 Write）
- *   - edit_file          精确字符串/正则替换后写回（替代内置 Edit/MultiEdit）
- *   - search_files       递归搜索文件内容（替代内置 Grep）
+ *   - write_file         写入文件，自动加密落盘（替代内置 Write，支持 append / 行尾风格 / BOM 保留）
+ *   - edit_file          精确字符串/正则替换后写回（替代内置 Edit/MultiEdit，CRLF/LF 自动兼容）
+ *   - search_files       递归搜索文件内容（替代内置 Grep，支持 ** 目录通配、跳过二进制/超大文件）
+ *   - find_files         按文件名 glob 递归查找文件（替代内置 Glob）
+ *   - list_directory     列出目录内容（替代内置 LS）
+ *   - copy_path          复制文件或目录（替代 bash cp，加密环境必须经白名单进程）
+ *   - move_path          移动/重命名文件或目录（替代 bash mv）
+ *   - remove_path        删除文件或目录（替代 bash rm）
  *   - create_directory   递归创建目录
  *   - file_info          查询文件/目录信息
- *   - check_status       检查工具运行状态
+ *   - check_status       检查工具运行状态（可实测解密能力）
  */
 const fs = require("fs");
 const path = require("path");
@@ -31,32 +36,105 @@ const { z } = require("zod");
 const pkg = require("./package.json");
 const server = new McpServer({ name: "read-file-server", version: pkg.version });
 
+// read_file / read_files 返回内容的安全上限：超过则截断，避免撑爆 Agent 上下文
+const READ_MAX_CHARS = 400000;
+// search_files 单文件扫描上限：超过则跳过该文件（超大日志/minified 产物）
+const SCAN_MAX_BYTES = 5 * 1024 * 1024;
+// search_files 嗅探二进制的采样字节数：首块含 NUL 即视为二进制
+const BINARY_SNIFF_BYTES = 8192;
+
 /**
- * 读取文件内容。Node.js 进程被加密软件列为白名单，fs.readFileSync 可自动解密读到明文。
+ * 读取文件明文内容并做大文件与 BOM 处理。
+ * - 超过 maxChars 时截断并置 truncated 标记，由调用方提示改用 read_file_partial
+ * - 剥离 UTF-8 BOM 并记录，写回工具据此外决定是否补回，避免 oldString 匹配失败与 BOM 丢失
+ * 返回 { ok, content, size, truncated, hasBom }，失败返回 { ok:false, error }。
  */
-function readFileContent(filePath) {
+function readFileContent(filePath, maxChars) {
   try {
-    const content = fs.readFileSync(filePath, "utf-8");
+    let content = fs.readFileSync(filePath, "utf-8");
+    // Node 的 utf-8 解码会把 BOM 保留为开头的 \uFEFF，必须剥离，否则：
+    // 1) 返回给 Agent 的文本带不可见前缀干扰匹配；2) edit_file 对首行的 oldString 两级匹配均失败
+    const hasBom = content.charCodeAt(0) === 0xfeff;
+    if (hasBom) content = content.slice(1);
     // 加密环境下 stat.size 是密文字节数，与明文长度不一致，改用明文字节数避免误导
-    return { ok: true, content, size: Buffer.byteLength(content, "utf-8") };
+    const size = Buffer.byteLength(content, "utf-8");
+    const limit = maxChars || Infinity;
+    if (content.length > limit) {
+      return {
+        ok: true,
+        content: content.slice(0, limit),
+        size,
+        truncated: true,
+        totalChars: content.length,
+        hasBom,
+      };
+    }
+    return { ok: true, content, size, truncated: false, hasBom };
   } catch (e) {
     if (e.code === "ENOENT") {
       return { ok: false, error: "文件不存在: " + filePath };
+    }
+    if (e.code === "EISDIR") {
+      return { ok: false, error: "路径是目录而非文件: " + filePath };
     }
     return { ok: false, error: "读取失败（可能是密文，请确认 Node.js 是否被加密软件列为白名单进程）: " + e.message };
   }
 }
 
+/**
+ * 将 glob 模式编译为正则：支持 *（不含路径分隔符）、**（跨目录任意字符）、?（单字符）。
+ * 统一使用 / 作为路径分隔符（匹配前已把 Windows 的 \ 归一），与 Agent 的 glob 习惯一致。
+ */
+function globToRegex(glob) {
+  let re = "";
+  for (let i = 0; i < glob.length; i++) {
+    const ch = glob[i];
+    if (ch === "*") {
+      if (glob[i + 1] === "*") {
+        // ** 跨目录任意匹配（连同后随的 / 一并吞掉，避免空段）
+        re += ".*";
+        i++;
+        if (glob[i + 1] === "/") i++;
+      } else {
+        // * 不跨目录
+        re += "[^/]*";
+      }
+    } else if (ch === "?") {
+      re += "[^/]";
+    } else if (/[.+^${}()|[\]\\]/.test(ch)) {
+      re += "\\" + ch;
+    } else {
+      re += ch;
+    }
+  }
+  return new RegExp("^" + re + "$");
+}
+
+/**
+ * 判断 buffer 首块是否含二进制特征（NUL 字节），用于 search_files 跳过图片/exe 等。
+ */
+function isBinaryBuffer(buf) {
+  const len = Math.min(buf.length, BINARY_SNIFF_BYTES);
+  for (let i = 0; i < len; i++) {
+    if (buf[i] === 0) return true;
+  }
+  return false;
+}
+
 // 注册 read_file 工具
 server.tool(
   "read_file",
-  "读取指定路径的文件内容（明文）。加密软件环境下，Node.js 进程作为白名单可自动解密读取明文。适用于读取代码、配置、文档等文本文件。替代内置 Read 工具。",
-  { path: z.string().describe("文件路径，支持相对路径或绝对路径") },
+  "读取指定路径的文件内容（明文）。加密软件环境下，Node.js 进程作为白名单可自动解密读取明文。适用于读取代码、配置、文档等文本文件。超大文件自动截断（提示改用 read_file_partial 分页读取）。替代内置 Read 工具。",
+  { path: z.string().describe("文件路径，支持相对路径或绝对路径（相对路径以 MCP Server 启动目录为基准，建议用绝对路径）") },
   { readOnlyHint: true },
   async ({ path: filePath }) => {
-    const result = readFileContent(filePath);
+    const result = readFileContent(filePath, READ_MAX_CHARS);
     if (result.ok) {
-      return { content: [{ type: "text", text: result.content }] };
+      let text = result.content;
+      if (result.truncated) {
+        text += "\n\n⚠️ 文件共 " + result.totalChars + " 字符，已截断为前 " + result.content.length + " 字符。请改用 read_file_partial 分页读取后续内容。";
+      }
+      return { content: [{ type: "text", text }] };
     } else {
       return { content: [{ type: "text", text: "❌ " + result.error }], isError: true };
     }
@@ -66,24 +144,40 @@ server.tool(
 // 注册 read_files 工具（批量读取）
 server.tool(
   "read_files",
-  "批量读取多个文件的内容（明文）。多个路径用逗号分隔。加密软件环境下通过 Node.js 白名单进程自动解密。",
-  { paths: z.string().describe("文件路径列表，多个路径用英文逗号分隔") },
+  "批量读取多个文件的内容（明文）。paths 推荐传字符串数组（MCP 原生支持）；兼容旧版的英文逗号分隔字符串（注意：Windows 路径可合法包含逗号，含逗号路径必须用数组形式）。单文件超限自动截断。加密软件环境下通过 Node.js 白名单进程自动解密。",
+  {
+    paths: z.union([z.array(z.string()), z.string()]).describe("文件路径列表：字符串数组（推荐）或英文逗号分隔的字符串（兼容旧版）"),
+  },
   { readOnlyHint: true },
-  async ({ paths: pathsStr }) => {
-    const pathList = pathsStr.split(",").map(p => p.trim()).filter(p => p);
+  async ({ paths }) => {
+    // 兼容两种入参：数组直接用；字符串按逗号切分（旧版行为，含逗号路径应改用数组）
+    const pathList = Array.isArray(paths)
+      ? paths.map((p) => String(p).trim()).filter(Boolean)
+      : String(paths).split(",").map((p) => p.trim()).filter(Boolean);
     if (!pathList.length) {
       return { content: [{ type: "text", text: "❌ 未提供任何文件路径" }], isError: true };
     }
     const results = [];
+    let okCount = 0;
     for (const p of pathList) {
-      const result = readFileContent(p);
+      const result = readFileContent(p, READ_MAX_CHARS);
       if (result.ok) {
-        results.push("========== 文件: " + p + " ==========\n" + result.content);
+        okCount++;
+        let body = result.content;
+        if (result.truncated) {
+          body += "\n\n⚠️ [单文件已截断，共 " + result.totalChars + " 字符，如需后续内容请用 read_file_partial]";
+        }
+        results.push("========== 文件: " + p + " ==========\n" + body);
       } else {
         results.push("========== 文件: " + p + " 【读取失败】 ==========\n❌ " + result.error);
       }
     }
-    return { content: [{ type: "text", text: results.join("\n\n") }] };
+    // 全部失败时置错误标记，避免 Agent 误判批量读取成功
+    const allFailed = okCount === 0;
+    return {
+      content: [{ type: "text", text: results.join("\n\n") }],
+      ...(allFailed ? { isError: true } : {}),
+    };
   }
 );
 
@@ -111,9 +205,15 @@ server.tool(
       if (charCount === undefined) {
         return { content: [{ type: "text", text: "❌ mode=chars 时必须提供 charCount 参数" }], isError: true };
       }
-      const slice = content.slice(0, charCount);
+      let end = charCount;
+      // 避免把代理对（emoji/生僻字）切成两半产生孤立代理项乱码：落在高位代理上时右移一位
+      if (end < totalChars) {
+        const code = content.charCodeAt(end - 1);
+        if (code >= 0xd800 && code <= 0xdbff) end++;
+      }
+      const slice = content.slice(0, end);
       const header = "📄 文件: " + filePath + "\n模式: 前 " + charCount + " 字符（共 " + totalChars + " 字符）\n";
-      const footer = charCount < totalChars ? "\n\n...(已截断，还有 " + (totalChars - charCount) + " 字符未显示)" : "";
+      const footer = end < totalChars ? "\n\n...(已截断，还有 " + (totalChars - end) + " 字符未显示)" : "";
       return { content: [{ type: "text", text: header + "──────────────────────\n" + slice + footer }] };
     }
 
@@ -121,12 +221,18 @@ server.tool(
     if (startLine === undefined) {
       return { content: [{ type: "text", text: "❌ mode=lines 时必须提供 startLine 参数" }], isError: true };
     }
-    const lines = content.split(/\r?\n/);
+    let lines = content.split(/\r?\n/);
+    // 文件以换行结尾时 split 产生尾部空元素，与编辑器行号语义不符（100行文件不应显示101行）
+    if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
     const totalLines = lines.length;
     const sLine = startLine;
     const eLine = endLine !== undefined ? endLine : startLine;
     if (eLine < sLine) {
       return { content: [{ type: "text", text: "❌ endLine 不能小于 startLine" }], isError: true };
+    }
+    // 起始行超出总行数时明确报错，而不是返回倒挂的空区间
+    if (sLine > totalLines) {
+      return { content: [{ type: "text", text: "❌ startLine " + sLine + " 超出文件总行数 " + totalLines + "（文件: " + filePath + "）" }], isError: true };
     }
     // 行号从1开始，数组索引从0开始
     const startIdx = Math.max(0, sLine - 1);
@@ -148,20 +254,40 @@ server.tool(
 // 注册 write_file 工具（加密软件环境下安全写回）
 server.tool(
   "write_file",
-  "将内容写入指定路径（明文）。加密软件环境下，Node.js 白名单进程写入会自动加密落盘，适用于安全写回加密文件。替代内置 Write 工具。",
+  "将内容写入指定路径（明文）。支持追加模式（mode=append）与覆盖模式（默认）；覆盖已有文件时行尾风格自动跟随原文件（避免制造混合行尾）、已有 BOM 自动保留。加密软件环境下，Node.js 白名单进程写入会自动加密落盘，适用于安全写回加密文件。替代内置 Write 工具。",
   {
-    path: z.string().describe("文件路径，支持相对路径或绝对路径"),
+    path: z.string().describe("文件路径，支持相对路径或绝对路径（相对路径以 MCP Server 启动目录为基准，建议用绝对路径）"),
     content: z.string().describe("写入的文件内容（明文）"),
+    mode: z.enum(["overwrite", "append"]).optional().describe("写入模式：overwrite=覆盖（默认）；append=追加到文件末尾"),
+    eol: z.enum(["auto", "lf", "crlf"]).optional().describe("行尾风格：auto=跟随已有文件（默认，新文件用 LF）；lf=强制 LF；crlf=强制 CRLF"),
   },
-  async ({ path: filePath, content }) => {
+  async ({ path: filePath, content, mode, eol }) => {
     try {
+      const writeMode = mode === "append" ? "append" : "overwrite";
+      let finalContent = content;
+      let existed = false;
+      if (writeMode === "overwrite" && fs.existsSync(filePath)) {
+        // 覆盖已有文件：读取原内容以继承 BOM 与主导行尾风格
+        existed = true;
+        const prev = readFileContent(filePath);
+        if (prev.ok) {
+          if (prev.hasBom) finalContent = "\uFEFF" + finalContent;
+          if (eol !== "lf" && eol !== "crlf") {
+            // eol=auto：新内容行尾跟随原文件主导风格，避免 CRLF 文件被写成 LF 混行
+            const prevEol = detectEol(prev.content);
+            if (prevEol === "\r\n") finalContent = normalizeEol(finalContent, "\r\n");
+          }
+        }
+      }
+      if (eol === "lf") finalContent = normalizeEol(finalContent, "\n");
+      if (eol === "crlf") finalContent = normalizeEol(finalContent, "\r\n");
       // 自动创建父目录，避免新文件路径不存在时直接报错
       const parent = path.dirname(filePath);
       if (parent && !fs.existsSync(parent)) {
         fs.mkdirSync(parent, { recursive: true });
       }
-      fs.writeFileSync(filePath, content, "utf-8");
-      return { content: [{ type: "text", text: "✅ 写入成功: " + filePath }] };
+      fs.writeFileSync(filePath, finalContent, { encoding: "utf-8", flag: writeMode === "append" ? "a" : "w" });
+      return { content: [{ type: "text", text: "✅ 写入成功" + (writeMode === "append" ? "（追加）" : "") + ": " + filePath }] };
     } catch (e) {
       return { content: [{ type: "text", text: "❌ 写入失败: " + e.message }], isError: true };
     }
@@ -243,15 +369,22 @@ server.tool(
   },
   async ({ path: filePath, oldString, newString, useRegex, replaceAll, ignoreCase }) => {
     try {
-      const original = fs.readFileSync(filePath, "utf-8");
+      // readFileContent 会剥离 BOM 并记录，写回时补回，避免 oldString 匹配首行失败
+      const readResult = readFileContent(filePath);
+      if (!readResult.ok) {
+        return { content: [{ type: "text", text: "❌ " + readResult.error }], isError: true };
+      }
+      const original = readResult.content;
+      const hasBom = readResult.hasBom;
       // 文件主导换行风格：CRLF 文件写入的替换文本也转成 CRLF，保持文件风格统一
       const fileEol = detectEol(original);
       const normalizedNew = normalizeEol(newString, fileEol);
       let matcher;
       if (useRegex) {
         try {
-          const flags = replaceAll ? "g" : "";
-          matcher = new RegExp(oldString, ignoreCase ? flags + "i" : flags);
+          // 正则模式默认附加 m 标志：^/$ 按行锚定（Agent 常用行级正则习惯），JS 无内联标志无法由调用方自行开启
+          const flags = (replaceAll ? "g" : "") + "m" + (ignoreCase ? "i" : "");
+          matcher = new RegExp(oldString, flags);
         } catch (e) {
           return { content: [{ type: "text", text: "❌ 正则表达式无效: " + e.message }], isError: true };
         }
@@ -260,10 +393,11 @@ server.tool(
       let updated;
       let eolAdapted = false; // 是否触发了换行符兼容替换
       if (useRegex) {
-        const globalMatcher = new RegExp(matcher.source, "g" + (ignoreCase ? "i" : ""));
+        // 计数与替换均带 m 标志，保持与构造 matcher 时一致
+        const globalMatcher = new RegExp(matcher.source, "gm" + (ignoreCase ? "i" : ""));
         const matches = original.match(globalMatcher);
         count = matches ? matches.length : 0;
-        const replaceMatcher = replaceAll ? globalMatcher : new RegExp(matcher.source, ignoreCase ? "i" : "");
+        const replaceMatcher = replaceAll ? globalMatcher : new RegExp(matcher.source, "m" + (ignoreCase ? "i" : ""));
         updated = original.replace(replaceMatcher, normalizedNew);
       } else {
         if (oldString === "") {
@@ -314,7 +448,8 @@ server.tool(
       if (updated === original) {
         return { content: [{ type: "text", text: "⚠️ 替换后内容无变化，文件未修改: " + filePath }] };
       }
-      fs.writeFileSync(filePath, updated, "utf-8");
+      // 原文件带 BOM 时补回，保持文件编码特征不变（部分 Windows 软件依赖 BOM）
+      fs.writeFileSync(filePath, (hasBom ? "\uFEFF" : "") + updated, "utf-8");
       return {
         content: [{ type: "text", text: "✅ 替换成功: " + filePath + "\n替换 " + (replaceAll ? count : 1) + "/" + count + " 处" + warning }],
       };
@@ -330,17 +465,18 @@ server.tool(
 // 注册 search_files 工具（内容搜索，替代受加密影响的 Grep）
 server.tool(
   "search_files",
-  "在指定目录递归搜索文件内容（明文）。加密软件环境下内置 Grep(ripgrep) 只能读到密文搜不到内容，本工具用 Node.js fs 读取后正则匹配。替代内置 Grep 工具。",
+  "在指定目录递归搜索文件内容（明文）。支持 include glob 过滤（*.java 或 **/*.js 均可，多个用逗号分隔）；自动跳过二进制文件、超大文件（>5MB）、常见依赖/构建目录与隐藏文件（如 .env）。加密软件环境下内置 Grep(ripgrep) 只能读到密文搜不到内容，本工具用 Node.js fs 读取后正则匹配。替代内置 Grep 工具。注意：逐行匹配，不支持跨行正则。",
   {
-    pattern: z.string().describe("正则表达式（如 log.*Error、function\\s+\\w+）"),
-    path: z.string().describe("搜索根目录，支持相对路径或绝对路径"),
-    include: z.string().optional().describe("文件名 glob 过滤，多个用逗号分隔（如 *.java,*.xml）。不传则搜索全部文件"),
+    pattern: z.string().describe("正则表达式（如 log.*Error、function\\s+\\w+），按行匹配，不支持跨行"),
+    path: z.string().describe("搜索根目录（或单个文件），支持相对路径或绝对路径"),
+    include: z.string().optional().describe("glob 过滤，多个用逗号分隔。支持文件名（*.java）与带目录通配的形式（src/**/*.js、**/*.test.ts）"),
+    exclude: z.string().optional().describe("额外排除的目录名，逗号分隔（默认已排除 node_modules/.git/target/build/dist 等）"),
     ignoreCase: z.boolean().optional().describe("是否忽略大小写，默认 false"),
     onlyMatching: z.boolean().optional().describe("是否只输出匹配部分（非整行），默认 false 输出整行"),
-    maxResults: z.number().optional().describe("最大返回匹配数，默认 200。超过会在末尾提示被截断"),
+    maxResults: z.number().int().positive().optional().describe("最大返回匹配数（正整数），默认 200。超过会在末尾提示被截断"),
   },
   { readOnlyHint: true },
-  async ({ pattern, path: rootDir, include, ignoreCase, onlyMatching, maxResults }) => {
+  async ({ pattern, path: rootDir, include, exclude, ignoreCase, onlyMatching, maxResults }) => {
     try {
       // 修正：忽略大小写时需同时携带 g 与 i 标志，否则 ignoreCase 参数失效
       const flags = ignoreCase ? "gi" : "g";
@@ -353,26 +489,41 @@ server.tool(
       const includeList = include
         ? include.split(",").map((s) => s.trim()).filter(Boolean)
         : null;
-      // include glob 匹配: 仅比对文件名(不含目录), * -> .*, 其余转义
-      const matchesInclude = (name) => {
-        if (!includeList) return true;
-        return includeList.some((pat) => {
-          const re = new RegExp("^" + pat.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$");
-          return re.test(name);
-        });
+      // include glob 匹配：对「相对根目录的 posix 路径」做全路径匹配，
+      // 同时兼容 basename 命中，**/*.js 与 src/**/*.js 均可正确工作
+      const includeRegexes = includeList
+        ? includeList.map((pat) => ({ pat, re: globToRegex(pat.replace(/\\/g, "/")) }))
+        : null;
+      const matchesInclude = (full) => {
+        if (!includeRegexes) return true;
+        const rel = path.relative(rootDir, full).replace(/\\/g, "/");
+        return includeRegexes.some(({ re }) => re.test(rel));
       };
+      // 默认忽略目录：依赖/构建产物/IDE 缓存，可经 exclude 追加
+      const DEFAULT_IGNORE = ["node_modules", ".git", "target", "build", "dist", ".idea", ".vscode", ".svn", "bin", "obj", "out", "vendor"];
+      const excludeSet = new Set(DEFAULT_IGNORE);
+      if (exclude) {
+        for (const name of exclude.split(",").map((s) => s.trim()).filter(Boolean)) excludeSet.add(name);
+      }
       const limit = maxResults || 200;
       const results = [];
       let truncated = false;
       let scanned = 0;
+      let skippedBinary = 0;
+      let skippedLarge = 0;
       let matchedFiles = 0;
       // 对单个文件做内容匹配, 复用与目录遍历相同的行级逻辑
-      const scanFile = (full) => {
-        if (!matchesInclude(path.basename(full))) return;
+      const scanFile = (full, size) => {
+        if (!matchesInclude(full)) return;
         scanned++;
+        // 超大文件直接跳过：minified 产物/大日志读入+正则可能卡死同步 server
+        if (size > SCAN_MAX_BYTES) { skippedLarge++; return; }
         let content;
         try {
-          content = fs.readFileSync(full, "utf-8");
+          // 先按 buffer 读以嗅探二进制（图片/exe/dll 含 NUL 字节），避免整读后才发现
+          const buf = fs.readFileSync(full);
+          if (isBinaryBuffer(buf)) { skippedBinary++; return; }
+          content = buf.toString("utf-8");
         } catch (e) {
           return;
         }
@@ -413,12 +564,16 @@ server.tool(
         }
         for (const entry of entries) {
           if (truncated) return;
+          // 隐藏文件/目录默认跳过（.env/.gitignore 等可能含密钥，且多为配置噪音）
+          if (entry.name.startsWith(".")) continue;
           const full = path.join(dir, entry.name);
           if (entry.isDirectory()) {
-            if (["node_modules", ".git", "target", "build", "dist", ".idea", ".vscode"].includes(entry.name)) continue;
+            if (excludeSet.has(entry.name)) continue;
             walk(full);
           } else if (entry.isFile()) {
-            scanFile(full);
+            let size = 0;
+            try { size = fs.statSync(full).size; } catch (e) { /* stat 失败按 0 处理，交给 readFileSync 报错 */ }
+            scanFile(full, size);
           }
         }
       };
@@ -435,16 +590,22 @@ server.tool(
         return { content: [{ type: "text", text: "❌ 无法访问路径: " + e.message }], isError: true };
       }
       if (stat.isFile()) {
-        scanFile(rootDir);
+        scanFile(rootDir, stat.size);
       } else if (stat.isDirectory()) {
         walk(rootDir);
       }
       let text = results.join("\n");
       if (results.length === 0) {
-        text = "未找到匹配项（扫描 " + scanned + " 个文件，根目录: " + rootDir + "）";
+        let parts = ["未找到匹配项（扫描 " + scanned + " 个文件，根目录: " + rootDir + "）"];
+        if (skippedBinary) parts.push("跳过二进制文件 " + skippedBinary + " 个");
+        if (skippedLarge) parts.push("跳过超大文件(" + (SCAN_MAX_BYTES / 1024 / 1024) + "MB+) " + skippedLarge + " 个");
+        text = parts.join("，");
       } else {
         text = "找到 " + results.length + " 处匹配（" + matchedFiles + " 个文件，扫描 " + scanned + " 个文件）:\n" + text;
         if (truncated) text += "\n... 结果已达上限 " + limit + "，被截断。可通过 maxResults 调大。";
+        if (skippedBinary || skippedLarge) {
+          text += "\nℹ️ 已跳过: 二进制文件 " + skippedBinary + " 个，超大文件 " + skippedLarge + " 个。";
+        }
       }
       return { content: [{ type: "text", text }] };
     } catch (e) {
@@ -471,17 +632,33 @@ server.tool(
 // 注册 file_info 工具（查询文件/目录信息）
 server.tool(
   "file_info",
-  "查询文件或目录的信息：是否存在、类型、大小、修改时间等。加密软件环境下 stat 不读内容，结果准确。",
+  "查询文件或目录的信息：是否存在、类型、大小、修改时间、符号链接等。注意：加密环境下 stat.size 反映的是密文字节数（与明文不一致），文件场景请以 sizePlaintext（明文字节数）为准。",
   { path: z.string().describe("文件或目录路径，支持相对路径或绝对路径") },
   { readOnlyHint: true },
   async ({ path: filePath }) => {
     try {
-      const stat = fs.statSync(filePath);
+      // 用 lstat 不跟随符号链接：坏链接可区分「链接存在但目标丢失」与「真不存在」
+      const lstat = fs.lstatSync(filePath);
+      const isSymlink = lstat.isSymbolicLink();
+      let stat = lstat;
+      let targetInfo = null;
+      if (isSymlink) {
+        try {
+          stat = fs.statSync(filePath); // 跟随链接取真实目标信息
+          targetInfo = stat.isDirectory() ? "directory" : "file";
+        } catch (e) {
+          targetInfo = "broken（目标不存在）";
+        }
+      }
       const info = {
         path: filePath,
         exists: true,
-        type: stat.isDirectory() ? "directory" : "file",
-        size: stat.size,
+        type: isSymlink ? "symlink" : lstat.isDirectory() ? "directory" : "file",
+        ...(isSymlink ? { symlinkTarget: fs.readlinkSync(filePath), targetType: targetInfo } : {}),
+        // 密文字节数：加密环境下的磁盘占用，与明文大小不一致
+        sizeOnDisk: stat.size,
+        // 明文字节数：仅文件场景提供，读取内容后统计（目录返回 null）
+        sizePlaintext: !isSymlink && !lstat.isDirectory() ? Buffer.byteLength(readFileContent(filePath).content || "", "utf-8") : null,
         modifiedTime: stat.mtime.toISOString(),
         createdTime: stat.birthtime.toISOString(),
       };
@@ -498,11 +675,252 @@ server.tool(
 // 注册 check_status 工具
 server.tool(
   "check_status",
-  "检查文件操作工具的运行状态，确认 Node.js 进程能否正常读取加密文件明文。",
-  {},
+  "检查文件操作工具的运行状态。可选提供 path 参数做实测：真实读取该文件验证 Node.js 白名单解密能力（读到明文返回成功；不传则只做基础心跳检查，不验证解密）。",
+  {
+    path: z.string().optional().describe("可选。提供时实际读取该文件验证明文可读性（建议传一个已知的加密文件）"),
+  },
   { readOnlyHint: true },
-  async () => {
-    return { content: [{ type: "text", text: "✅ read-file-server 运行中\n平台: Node.js " + process.version + "\n功能: 通过 Node.js fs 读写文件明文（加密软件白名单中的 Node.js 进程自动解密/加密）" }] };
+  async ({ path: filePath }) => {
+    let base = "✅ read-file-server 运行中\n平台: Node.js " + process.version + "\n版本: " + pkg.version + "\n功能: 通过 Node.js fs 读写文件明文（加密软件白名单中的 Node.js 进程自动解密/加密）";
+    if (filePath === undefined) {
+      base += "\n提示: 传入 path 参数可实测解密能力（本次未做实测）";
+      return { content: [{ type: "text", text: base }] };
+    }
+    // 实测模式：真实读一次文件，验证白名单解密链路
+    const result = readFileContent(filePath, 200);
+    if (result.ok) {
+      return {
+        content: [{
+          type: "text",
+          text: base + "\n\n实测: 已成功读取 " + filePath + "（前 " + Math.min(result.content.length, 200) + " 字符，明文大小 " + result.size + " 字节）\n结论: Node.js 解密能力正常。",
+        }],
+      };
+    } else {
+      return {
+        content: [{ type: "text", text: base + "\n\n实测: 读取 " + filePath + " 失败 -- " + result.error + "\n结论: Node.js 可能不在加密软件白名单，请联系管理员将 node.exe 加入白名单。" }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// 注册 list_directory 工具（列目录，替代内置 LS）
+server.tool(
+  "list_directory",
+  "列出指定目录的内容（文件与子目录清单），加密环境下替代内置 LS / bash ls。每项含名称、类型（file/directory/symlink）、大小与修改时间；默认不显示隐藏项。",
+  {
+    path: z.string().describe("目录路径，支持相对路径或绝对路径"),
+    showHidden: z.boolean().optional().describe("是否包含以 . 开头的隐藏项，默认 false"),
+  },
+  { readOnlyHint: true },
+  async ({ path: dirPath, showHidden }) => {
+    try {
+      const stat = fs.statSync(dirPath);
+      if (!stat.isDirectory()) {
+        return { content: [{ type: "text", text: "❌ 路径不是目录: " + dirPath }], isError: true };
+      }
+      const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+      const lines = [];
+      for (const entry of entries) {
+        if (!showHidden && entry.name.startsWith(".")) continue;
+        const full = path.join(dirPath, entry.name);
+        let type = "file";
+        let size = "";
+        let mtime = "";
+        try {
+          const st = fs.lstatSync(full);
+          if (st.isSymbolicLink()) type = "symlink";
+          else if (st.isDirectory()) type = "directory";
+          // 注意：size 为密文字节数（加密环境），仅供参考
+          size = st.isDirectory() ? "-" : String(st.size);
+          mtime = st.mtime.toISOString().replace("T", " ").slice(0, 19);
+        } catch (e) { /* stat 失败时保留默认值 */ }
+        lines.push(String(type === "directory" ? "DIR " : "FILE").padEnd(5) + " " + size.padStart(10) + "  " + mtime + "  " + entry.name);
+      }
+      const header = "目录: " + dirPath + "（共 " + lines.length + " 项" + (showHidden ? "" : "，不含隐藏项") + "）";
+      return { content: [{ type: "text", text: lines.length ? header + "\n" + lines.join("\n") : header + "\n（空目录或全部被隐藏项过滤）" }] };
+    } catch (e) {
+      if (e.code === "ENOENT") {
+        return { content: [{ type: "text", text: "❌ 目录不存在: " + dirPath }], isError: true };
+      }
+      return { content: [{ type: "text", text: "❌ 列目录失败: " + e.message }], isError: true };
+    }
+  }
+);
+
+// 注册 find_files 工具（按文件名 glob 查找，替代内置 Glob）
+server.tool(
+  "find_files",
+  "按文件名 glob 模式递归查找文件/目录（如 *.test.js、**/*.java、src/**/*.ts），加密环境下替代内置 Glob / bash find。默认跳过 node_modules、.git 等依赖与构建目录。",
+  {
+    pattern: z.string().describe("glob 模式，如 *.java、**/*.test.js、src/**/*.ts。* 不跨目录，** 跨目录"),
+    path: z.string().describe("搜索根目录，支持相对路径或绝对路径"),
+    maxResults: z.number().int().positive().optional().describe("最大返回条数（正整数），默认 500"),
+  },
+  { readOnlyHint: true },
+  async ({ pattern, path: rootDir, maxResults }) => {
+    try {
+      const limit = maxResults || 500;
+      const regex = globToRegex(pattern.replace(/\\/g, "/"));
+      const results = [];
+      let truncated = false;
+      // 与 search_files 一致的默认忽略列表，另含隐藏目录
+      const IGNORE = ["node_modules", ".git", "target", "build", "dist", ".idea", ".vscode", ".svn", "bin", "obj", "out", "vendor"];
+      const walk = (dir) => {
+        if (truncated) return;
+        let entries;
+        try {
+          entries = fs.readdirSync(dir, { withFileTypes: true });
+        } catch (e) {
+          return;
+        }
+        for (const entry of entries) {
+          if (truncated) return;
+          if (entry.name.startsWith(".")) continue;
+          const full = path.join(dir, entry.name);
+          const rel = path.relative(rootDir, full).replace(/\\/g, "/");
+          if (regex.test(rel)) {
+            results.push((entry.isDirectory() ? "DIR  " : "FILE ") + full);
+            if (results.length >= limit) { truncated = true; return; }
+          }
+          if (entry.isDirectory()) {
+            if (!IGNORE.includes(entry.name)) walk(full);
+          }
+        }
+      };
+      let stat;
+      try {
+        stat = fs.statSync(rootDir);
+      } catch (e) {
+        if (e.code === "ENOENT") {
+          return { content: [{ type: "text", text: "❌ 路径不存在: " + rootDir }], isError: true };
+        }
+        return { content: [{ type: "text", text: "❌ 无法访问路径: " + e.message }], isError: true };
+      }
+      // 根路径本身也参与匹配（如 pattern 恰好等于根目录名）
+      if (!stat.isDirectory()) {
+        return { content: [{ type: "text", text: "❌ 路径不是目录: " + rootDir }], isError: true };
+      }
+      walk(rootDir);
+      let text;
+      if (results.length === 0) {
+        text = "未找到匹配 " + pattern + " 的文件（根目录: " + rootDir + "）";
+      } else {
+        text = "找到 " + results.length + " 个匹配（根目录: " + rootDir + "）:\n" + results.join("\n");
+        if (truncated) text += "\n... 结果已达上限 " + limit + "，被截断。可通过 maxResults 调大。";
+      }
+      return { content: [{ type: "text", text }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: "❌ 查找失败: " + e.message }], isError: true };
+    }
+  }
+);
+
+// 注册 copy_path 工具（复制文件/目录，替代 bash cp）
+server.tool(
+  "copy_path",
+  "复制文件或目录（目录递归复制）。加密环境下必须经 Node.js 白名单进程复制（bash cp 产出密文/双重加密文件，在白名单视图下即损坏）。目标已存在时：文件被覆盖，目录合并。",
+  {
+    source: z.string().describe("源路径（文件或目录）"),
+    destination: z.string().describe("目标路径。目标已存在时文件覆盖、目录合并；不存在时自动创建"),
+  },
+  async ({ source, destination }) => {
+    try {
+      const srcStat = fs.statSync(source);
+      const destExists = fs.existsSync(destination);
+      // 目标为已存在目录时，将源合并/放入目标目录下（与 bash cp 的自然预期一致）
+      let finalDest = destination;
+      if (destExists && fs.statSync(destination).isDirectory() && path.basename(source)) {
+        finalDest = path.join(destination, path.basename(source));
+      }
+      const destStat = fs.existsSync(finalDest) ? fs.statSync(finalDest) : null;
+      // 类型冲突检查：文件 -> 已有目录 或 目录 -> 已有文件，均直接报错避免误操作
+      if (srcStat.isFile() && destStat && destStat.isDirectory()) {
+        return { content: [{ type: "text", text: "❌ 无法复制：源是文件但目标是已存在的目录: " + finalDest }], isError: true };
+      }
+      if (srcStat.isDirectory() && destStat && destStat.isFile()) {
+        return { content: [{ type: "text", text: "❌ 无法复制：源是目录但目标是已存在的文件: " + finalDest }], isError: true };
+      }
+      fs.cpSync(source, finalDest, { recursive: srcStat.isDirectory(), force: true });
+      return { content: [{ type: "text", text: "✅ 复制成功: " + source + " -> " + finalDest + (srcStat.isDirectory() ? "（递归目录）" : "") }] };
+    } catch (e) {
+      if (e.code === "ENOENT") {
+        return { content: [{ type: "text", text: "❌ 源路径不存在: " + source }], isError: true };
+      }
+      return { content: [{ type: "text", text: "❌ 复制失败: " + e.message }], isError: true };
+    }
+  }
+);
+
+// 注册 move_path 工具（移动/重命名，替代 bash mv）
+server.tool(
+  "move_path",
+  "移动或重命名文件/目录。同盘符用 rename（原子操作），跨盘符自动回退为复制后删除源。加密环境下替代 bash mv。",
+  {
+    source: z.string().describe("源路径（文件或目录）"),
+    destination: z.string().describe("目标路径。目标已存在的目录则移入其下；目标已存在的文件则覆盖"),
+  },
+  async ({ source, destination }) => {
+    try {
+      const srcStat = fs.statSync(source);
+      let finalDest = destination;
+      // 目标为已存在目录时移入其下（与 bash mv 预期一致）
+      if (fs.existsSync(destination) && fs.statSync(destination).isDirectory()) {
+        finalDest = path.join(destination, path.basename(source));
+      }
+      try {
+        fs.renameSync(source, finalDest);
+        return { content: [{ type: "text", text: "✅ 移动成功: " + source + " -> " + finalDest }] };
+      } catch (e) {
+        if (e.code === "EXDEV") {
+          // 跨盘符：rename 不可用，回退为 cp + rm
+          fs.cpSync(source, finalDest, { recursive: srcStat.isDirectory(), force: true });
+          fs.rmSync(source, { recursive: srcStat.isDirectory(), force: true });
+          return { content: [{ type: "text", text: "✅ 移动成功（跨盘符，复制后删除源）: " + source + " -> " + finalDest }] };
+        }
+        throw e;
+      }
+    } catch (e) {
+      if (e.code === "ENOENT") {
+        return { content: [{ type: "text", text: "❌ 源路径不存在: " + source }], isError: true };
+      }
+      return { content: [{ type: "text", text: "❌ 移动失败: " + e.message }], isError: true };
+    }
+  }
+);
+
+// 注册 remove_path 工具（删除文件/目录，替代 bash rm）
+server.tool(
+  "remove_path",
+  "删除文件或目录（目录默认递归删除，不可恢复，请谨慎使用）。加密环境下替代 bash rm。可选 recursive=false 时目录必须为空才可删除。",
+  {
+    path: z.string().describe("要删除的文件或目录路径"),
+    recursive: z.boolean().optional().describe("目录是否递归删除，默认 true。false 时目录非空会报错"),
+  },
+  async ({ path: targetPath, recursive }) => {
+    try {
+      const stat = fs.statSync(targetPath);
+      if (stat.isDirectory()) {
+        // 递归删除前统计内容数量，写入结果让调用方有迹可查
+        let count = 0;
+        try {
+          count = fs.readdirSync(targetPath).length;
+        } catch (e) { /* 统计失败不影响删除 */ }
+        fs.rmSync(targetPath, { recursive: recursive !== false, force: false });
+        return { content: [{ type: "text", text: "✅ 已删除目录" + (recursive !== false && count ? "（含 " + count + " 项内容）" : "") + ": " + targetPath }] };
+      }
+      fs.rmSync(targetPath, { force: false });
+      return { content: [{ type: "text", text: "✅ 已删除文件: " + targetPath }] };
+    } catch (e) {
+      if (e.code === "ENOENT") {
+        return { content: [{ type: "text", text: "❌ 路径不存在: " + targetPath }], isError: true };
+      }
+      if (e.code === "ENOTEMPTY" || e.code === "EISDIR" || e.code === "ERR_FS_EISDIR") {
+        // rmSync 对非空目录且 recursive=false 在 Linux 抛 ENOTEMPTY，Windows 新版 Node 抛 ERR_FS_EISDIR
+        return { content: [{ type: "text", text: "❌ 目录非空，需 recursive=true（默认）才能递归删除: " + targetPath }], isError: true };
+      }
+      return { content: [{ type: "text", text: "❌ 删除失败: " + e.message }], isError: true };
+    }
   }
 );
 

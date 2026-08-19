@@ -32,11 +32,16 @@ description: 在文件加密软件（天锐绿盾 / IP-Guard / 亿赛通 / 深�
 | 写文件 | `Write` | `mcp__read-file-server__write_file` |
 | 精确编辑 | `Edit` / `MultiEdit` | `mcp__read-file-server__edit_file` |
 | 搜索内容 | `Grep` | `mcp__read-file-server__search_files` |
+| 按文件名查找 | `Glob` | `mcp__read-file-server__find_files` |
+| 列目录内容 | `LS` | `mcp__read-file-server__list_directory` |
+| 复制文件/目录 | `Bash cp` | `mcp__read-file-server__copy_path` |
+| 移动/重命名 | `Bash mv` | `mcp__read-file-server__move_path` |
+| 删除文件/目录 | `Bash rm` | `mcp__read-file-server__remove_path` |
 | 创建目录 | （无） | `mcp__read-file-server__create_directory` |
 | 查文件信息 | （无） | `mcp__read-file-server__file_info` |
 | 健康检查 | （无） | `mcp__read-file-server__check_status` |
 
-> **强约束**：在加密环境下，**禁止使用** `Read/Write/Edit/MultiEdit/Grep` 内置工具--它们会读到密文或破坏加密结构。
+> **强约束**：在加密环境下，**禁止使用** `Read/Write/Edit/MultiEdit/Grep/Glob/LS` 内置工具与 `Bash` 的 `cp/mv/rm` 文件操作--它们会读到密文、写出密文或破坏加密结构。
 
 ---
 
@@ -134,9 +139,11 @@ description: 在文件加密软件（天锐绿盾 / IP-Guard / 亿赛通 / 深�
 2. **`edit_file` 前必读**：必须先 `read_file` 拿到明文，再从原文里**原样复制** `oldString`，否则会因为空格/缩进不匹配而失败
 3. **换行风格无需担心**：文件是 CRLF 而 `oldString` 是 LF（或相反）时，`edit_file` 会自动归一换行后匹配；`newString` 行尾也会自动跟随文件主导风格，不会产生混行
 4. **`write_file` 是覆盖写**：会清空原文件再写入，重要文件修改前建议先 `read_file` 备份内容
-5. **`search_files` 自动跳过**：`node_modules`、`.git`、`target`、`build`、`dist`、`.idea`、`.vscode`
+5. **`search_files` / `find_files` 自动跳过**：`node_modules`、`.git`、`target`、`build`、`dist`、`.svn`、`bin`、`obj`、`out`、`vendor` 与 `.` 开头的隐藏文件/目录；`search_files` 另跳过二进制与超过 5MB 的文件
 6. **大批量搜索**：用 `maxResults` 控制返回数量，避免一次性返回过多结果
-7. **工具调用顺序**：复杂任务先 `check_status` 确认 MCP 正常，再正式操作
+7. **工具调用顺序**：复杂任务先 `check_status`（可传 path 实测解密）确认 MCP 正常，再正式操作
+8. **`remove_path` 不可恢复**：递归删除前建议先 `list_directory` 确认内容
+9. **`read_files` 路径含逗号时必须传数组**：Windows 路径可合法包含英文逗号，逗号分隔字符串形式会被错误切分
 
 ---
 
@@ -146,7 +153,10 @@ description: 在文件加密软件（天锐绿盾 / IP-Guard / 亿赛通 / 深�
 |------|----------|----------|
 | 读到的还是密文/乱码 | Node.js 不在加密软件白名单 | 联系管理员把 `node.exe` 加入白名单 |
 | `mcp__read-file-server__*` 工具全部不可见 | MCP Server 未配置或未启动 | 见 `README.md` 配置 `.mcp.json` |
-| `edit_file` 报"未找到匹配内容" | `oldString` 拼写、缩进不对（换行 CRLF/LF 差异已自动兼容） | 重新 `read_file` 复制原文，**不要凭记忆写**；重点检查空格与缩进 |
+| `edit_file` 报"未找到匹配内容" | `oldString` 拼写、缩进不对（换行 CRLF/LF 差异与 BOM 已自动兼容） | 重新 `read_file` 复制原文，**不要凭记忆写**；重点检查空格与缩进 |
+| 读取 GBK 等非 UTF-8 文件乱码 | 当前仅支持 UTF-8 | 暂不支持，避免对非 UTF-8 文件做编辑写回（会损坏数据） |
+| 大文件读取不完整 | 超过 40 万字符自动截断 | 用 `read_file_partial` 分页读取 |
+| `search_files` 搜不到某些文件 | 二进制/超大(>5MB)文件被跳过，或隐藏文件/忽略目录被排除 | 看返回尾部的跳过统计；必要时用 `include` 限定范围 |
 | `edit_file` 报"匹配到 N 处" | 文件中存在重复内容 | 加更长/更唯一的 `oldString` 唯一定位，或 `replaceAll=true` |
 | `search_files` 报"正则表达式无效" | 正则语法错误 | 检查 `pattern` 是否需要转义特殊字符 |
 | `write_file` 报权限错误 | 文件被占用或目录无写权限 | 关闭占用进程 / 检查目录权限 |
@@ -158,8 +168,8 @@ description: 在文件加密软件（天锐绿盾 / IP-Guard / 亿赛通 / 深�
 
 | 工具类型 | 在加密环境下 | 备注 |
 |----------|--------------|------|
-| 内置 `Read/Write/Edit/Grep` | ❌ 禁用 | 会读到密文或破坏加密 |
-| 内置 `Bash` | ⚠️ 慎用 | Bash 进程通常不在白名单，`cat`/`sed` 也会读到密文 |
+| 内置 `Read/Write/Edit/Grep/Glob/LS` | ❌ 禁用 | 会读到密文或破坏加密 |
+| 内置 `Bash` | ⚠️ 慎用 | Bash 进程通常不在白名单，`cat`/`sed`/`cp`/`mv`/`rm` 也会读到密文或产出密文文件；文件操作一律改用 MCP 工具 |
 | 内置 `Glob` | ✅ 可用 | 只列文件名，不读内容 |
 | 内置 `NotebookEdit` | ⚠️ 慎用 | 同 Edit |
 | `mcp__read-file-server__*` | ✅ 主用 | 本 Skill 推广的工具集 |

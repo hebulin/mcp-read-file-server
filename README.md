@@ -178,15 +178,20 @@ claude mcp list
 
 | 工具名 | 替代内置 | 功能 | 参数 |
 |--------|---------|------|------|
-| `read_file` | Read | 读取单个文件明文 | `path`: 文件路径 |
-| `read_files` | 多次 Read | 批量读取多个文件明文 | `paths`: 逗号分隔的路径 |
+| `read_file` | Read | 读取单个文件明文（超大文件自动截断） | `path` |
+| `read_files` | 多次 Read | 批量读取多个文件明文（数组或逗号分隔字符串） | `paths` |
 | `read_file_partial` | Read（局部） | 局部读取文件（前N字符 / 指定行范围） | `path`、`mode`、`charCount`、`startLine`、`endLine` |
-| `write_file` | Write | 写入文件（自动加密落盘） | `path`、`content` |
-| `edit_file` | Edit/MultiEdit | 精确字符串/正则替换后写回（自动兼容 CRLF/LF 换行差异） | `path`、`oldString`、`newString`、`useRegex`、`replaceAll`、`ignoreCase` |
-| `search_files` | Grep | 递归搜索文件内容 | `pattern`、`path`、`include`、`ignoreCase`、`onlyMatching`、`maxResults` |
+| `write_file` | Write | 写入文件（支持追加模式 / 行尾风格 / BOM 保留） | `path`、`content`、`mode`、`eol` |
+| `edit_file` | Edit/MultiEdit | 精确字符串/正则替换后写回（CRLF/LF 自动兼容、BOM 保留、正则默认多行模式） | `path`、`oldString`、`newString`、`useRegex`、`replaceAll`、`ignoreCase` |
+| `search_files` | Grep | 递归搜索文件内容（支持 `**` 目录通配、跳过二进制/超大文件） | `pattern`、`path`、`include`、`exclude`、`ignoreCase`、`onlyMatching`、`maxResults` |
+| `find_files` | Glob | 按文件名 glob 递归查找（如 `**/*.test.js`） | `pattern`、`path`、`maxResults` |
+| `list_directory` | LS | 列出目录内容（类型/大小/时间） | `path`、`showHidden` |
+| `copy_path` | bash cp | 复制文件/目录（递归；加密环境必须经白名单进程） | `source`、`destination` |
+| `move_path` | bash mv | 移动/重命名（跨盘符自动回退复制+删除） | `source`、`destination` |
+| `remove_path` | bash rm | 删除文件/目录（默认递归，谨慎使用） | `path`、`recursive` |
 | `create_directory` | - | 递归创建目录 | `path` |
-| `file_info` | - | 查询文件/目录信息 | `path` |
-| `check_status` | - | 检查工具运行状态 | 无 |
+| `file_info` | - | 查询文件/目录信息（含明文大小、符号链接） | `path` |
+| `check_status` | - | 检查运行状态（可实测解密能力） | `path`（可选） |
 
 ### `read_file_partial` 参数详解
 
@@ -213,8 +218,17 @@ Windows 下文件多为 CRLF 换行，而 AI Agent 生成的多行 `oldString` �
 - **匹配阶段**：先按字节原样精确匹配；未命中时自动将文件与 `oldString` 的换行符统一归一（`\r\n` / `\r` / `\n` 均视为换行）后再匹配，两种风格任意组合均可命中
 - **写入阶段**：`newString` 的行尾会自动转换为文件本身的主导换行风格，不会把 CRLF 文件改写为 LF 混行
 - **提示信息**：触发换行适配时，返回结果会附 `ℹ️ 换行符已自动适配` 说明，方便排查
+- **BOM 自动处理**：UTF-8 BOM 读取时自动剥离、写回时自动补回，`oldString` 无需关心 BOM
+- **正则模式默认多行**：`useRegex=true` 时自动附加 `m` 标志，`^xxx` / `xxx$` 按行锚定
 
 注意：该兼容仅针对换行符差异，空格、缩进等其他空白字符仍需与原文完全一致。
+
+### 其他内置保护
+
+- **大文件截断**：`read_file` / `read_files` 单文件超过 40 万字符自动截断，提示改用 `read_file_partial` 分页读取，避免撑爆上下文
+- **二进制/超大文件跳过**：`search_files` 自动跳过图片、exe 等二进制文件（首 8KB 含 NUL 判定）与超过 5MB 的文件，并在结果中说明跳过数量
+- **隐藏文件默认跳过**：`search_files` / `find_files` 默认跳过 `.` 开头的文件与目录（避免把 `.env` 等敏感内容灌入上下文），忽略目录还包含 `node_modules`、`.git`、`target`、`build`、`dist`、`vendor` 等；`list_directory` 可用 `showHidden=true` 显示
+- **GBK 等非 UTF-8 文件暂不支持**：当前按 UTF-8 读写，GBK 文件会出现乱码，编辑写回会损坏数据（后续版本计划支持 encoding 参数）
 
 ## 使用
 
