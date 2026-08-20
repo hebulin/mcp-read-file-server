@@ -178,15 +178,20 @@ claude mcp list
 
 | 工具名 | 替代内置 | 功能 | 参数 |
 |--------|---------|------|------|
-| `read_file` | Read | 读取单个文件明文 | `path`: 文件路径 |
-| `read_files` | 多次 Read | 批量读取多个文件明文 | `paths`: 逗号分隔的路径 |
+| `read_file` | Read | 读取单个文件明文（超大文件自动截断） | `path` |
+| `read_files` | 多次 Read | 批量读取多个文件明文（数组或逗号分隔字符串） | `paths` |
 | `read_file_partial` | Read（局部） | 局部读取文件（前N字符 / 指定行范围） | `path`、`mode`、`charCount`、`startLine`、`endLine` |
-| `write_file` | Write | 写入文件（自动加密落盘） | `path`、`content` |
-| `edit_file` | Edit/MultiEdit | 精确字符串/正则替换后写回 | `path`、`oldString`、`newString`、`useRegex`、`replaceAll`、`ignoreCase` |
-| `search_files` | Grep | 递归搜索文件内容 | `pattern`、`path`、`include`、`ignoreCase`、`onlyMatching`、`maxResults` |
+| `write_file` | Write | 写入文件（支持追加模式 / 行尾风格 / BOM 保留） | `path`、`content`、`mode`、`eol` |
+| `edit_file` | Edit/MultiEdit | 精确替换后写回（CRLF/LF 自动兼容、BOM 保留、正则多行模式、`edits` 批量原子编辑、失败附相似行诊断） | `path`、`oldString`、`newString`、`edits`、`useRegex`、`replaceAll`、`ignoreCase` |
+| `search_files` | Grep | 递归搜索文件内容（支持 `**` 目录通配、跳过二进制/超大文件） | `pattern`、`path`、`include`、`exclude`、`ignoreCase`、`onlyMatching`、`maxResults` |
+| `find_files` | Glob | 按文件名 glob 递归查找（如 `**/*.test.js`） | `pattern`、`path`、`maxResults` |
+| `list_directory` | LS | 列出目录内容（类型/大小/时间） | `path`、`showHidden` |
+| `copy_path` | bash cp | 复制文件/目录（递归；加密环境必须经白名单进程） | `source`、`destination` |
+| `move_path` | bash mv | 移动/重命名（跨盘符自动回退复制+删除） | `source`、`destination` |
+| `remove_path` | bash rm | 删除文件/目录（默认递归，谨慎使用） | `path`、`recursive` |
 | `create_directory` | - | 递归创建目录 | `path` |
-| `file_info` | - | 查询文件/目录信息 | `path` |
-| `check_status` | - | 检查工具运行状态 | 无 |
+| `file_info` | - | 查询文件/目录信息（含明文大小、符号链接） | `path` |
+| `check_status` | - | 检查运行状态（可实测解密能力） | `path`（可选） |
 
 ### `read_file_partial` 参数详解
 
@@ -205,6 +210,29 @@ claude mcp list
 - 读取第 5-20 行：`mode="lines"`, `startLine=5`, `endLine=20`
 
 > 返回内容会带文件名、读取范围、总字符数/总行数的头部信息，行模式下每行带行号前缀。超出文件范围时自动截断并提示。
+
+### `edit_file` 换行符自动兼容
+
+Windows 下文件多为 CRLF 换行，而 AI Agent 生成的多行 `oldString` 通常是 LF 换行，字节级比对会直接失败（报"未找到匹配内容"）。本工具已内置兼容逻辑：
+
+- **匹配阶段**：先按字节原样精确匹配；未命中时自动将文件与 `oldString` 的换行符统一归一（`\r\n` / `\r` / `\n` 均视为换行）后再匹配，两种风格任意组合均可命中
+- **写入阶段**：`newString` 的行尾会自动转换为文件本身的主导换行风格，不会把 CRLF 文件改写为 LF 混行
+- **提示信息**：触发换行适配时，返回结果会附 `ℹ️ 换行符已自动适配` 说明，方便排查
+- **BOM 自动处理**：UTF-8 BOM 读取时自动剥离、写回时自动补回，`oldString` 无需关心 BOM
+- **正则模式默认多行**：`useRegex=true` 时自动附加 `m` 标志，`^xxx` / `xxx$` 按行锚定
+- **批量原子编辑（edits 数组）**：一次调用完成多处修改，按序应用；**任一条目失败则整体不写盘**，不会产生「半改状态」。条目按文件现状顺序构造（前面条目的结果参与后续条目匹配）
+- **失败附相似行诊断**：字符串匹配失败时返回「可能相关的行」及相似度，直接对照排查空白/缩进差异，无需盲目重试
+
+注意：该兼容仅针对换行符差异，空格、缩进等其他空白字符仍需与原文完全一致。含反引号 `` ` `` 与 `${}` 的内容直接原样传参（JSON 传输无 JS 模板字面量转义问题）。
+
+### 其他内置保护
+
+- **预算读取（性能）**：`read_file` / `read_files` / `read_file_partial`(chars 模式) 只读取需要的字节数而非整个文件。读取 100MB 大文件的前 40 万字符从 ~160ms/100MB 内存降到 ~3ms/1.5MB 内存
+- **编码防损坏**：UTF-16 文件（BOM/字节特征检测）直接拒绝读取并提示转换；疑似非 UTF-8（GBK 等，含大量乱码替换字符）的文件 `edit_file` 拒绝编辑写回，防止不可逆损坏
+- **大文件截断**：`read_file` / `read_files` 单文件超过 40 万字符自动截断，提示改用 `read_file_partial` 分页读取，避免撑爆上下文
+- **二进制/超大文件跳过**：`search_files` 只预读首 8KB 判定二进制（图片/exe 含 NUL 字节）后即跳过，超过 5MB 的文件也跳过，并在结果中说明跳过数量
+- **隐藏文件默认跳过**：`search_files` / `find_files` 默认跳过 `.` 开头的文件与目录（避免把 `.env` 等敏感内容灌入上下文），忽略目录还包含 `node_modules`、`.git`、`target`、`build`、`dist`、`vendor` 等；`list_directory` 可用 `showHidden=true` 显示
+- **glob 支持 `{a,b}` 花括号**：`find_files` / `search_files` 的 include 支持 `src/**/*.{ts,tsx}` 这类 Agent 高频写法
 
 ## 使用
 
