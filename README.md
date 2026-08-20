@@ -182,7 +182,7 @@ claude mcp list
 | `read_files` | 多次 Read | 批量读取多个文件明文（数组或逗号分隔字符串） | `paths` |
 | `read_file_partial` | Read（局部） | 局部读取文件（前N字符 / 指定行范围） | `path`、`mode`、`charCount`、`startLine`、`endLine` |
 | `write_file` | Write | 写入文件（支持追加模式 / 行尾风格 / BOM 保留） | `path`、`content`、`mode`、`eol` |
-| `edit_file` | Edit/MultiEdit | 精确字符串/正则替换后写回（CRLF/LF 自动兼容、BOM 保留、正则默认多行模式） | `path`、`oldString`、`newString`、`useRegex`、`replaceAll`、`ignoreCase` |
+| `edit_file` | Edit/MultiEdit | 精确替换后写回（CRLF/LF 自动兼容、BOM 保留、正则多行模式、`edits` 批量原子编辑、失败附相似行诊断） | `path`、`oldString`、`newString`、`edits`、`useRegex`、`replaceAll`、`ignoreCase` |
 | `search_files` | Grep | 递归搜索文件内容（支持 `**` 目录通配、跳过二进制/超大文件） | `pattern`、`path`、`include`、`exclude`、`ignoreCase`、`onlyMatching`、`maxResults` |
 | `find_files` | Glob | 按文件名 glob 递归查找（如 `**/*.test.js`） | `pattern`、`path`、`maxResults` |
 | `list_directory` | LS | 列出目录内容（类型/大小/时间） | `path`、`showHidden` |
@@ -220,8 +220,10 @@ Windows 下文件多为 CRLF 换行，而 AI Agent 生成的多行 `oldString` �
 - **提示信息**：触发换行适配时，返回结果会附 `ℹ️ 换行符已自动适配` 说明，方便排查
 - **BOM 自动处理**：UTF-8 BOM 读取时自动剥离、写回时自动补回，`oldString` 无需关心 BOM
 - **正则模式默认多行**：`useRegex=true` 时自动附加 `m` 标志，`^xxx` / `xxx$` 按行锚定
+- **批量原子编辑（edits 数组）**：一次调用完成多处修改，按序应用；**任一条目失败则整体不写盘**，不会产生「半改状态」。条目按文件现状顺序构造（前面条目的结果参与后续条目匹配）
+- **失败附相似行诊断**：字符串匹配失败时返回「可能相关的行」及相似度，直接对照排查空白/缩进差异，无需盲目重试
 
-注意：该兼容仅针对换行符差异，空格、缩进等其他空白字符仍需与原文完全一致。
+注意：该兼容仅针对换行符差异，空格、缩进等其他空白字符仍需与原文完全一致。含反引号 `` ` `` 与 `${}` 的内容直接原样传参（JSON 传输无 JS 模板字面量转义问题）。
 
 ### 其他内置保护
 

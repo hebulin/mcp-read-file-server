@@ -85,8 +85,10 @@ description: 在文件加密软件（天锐绿盾 / IP-Guard / 亿赛通 / 深�
 ```
 1. mcp__read-file-server__read_file 读取明文
 2. 分析内容
-3. mcp__read-file-server__edit_file 修改
-   - oldString 必须从第 1 步读到的内容里**原样复制**（含空格、缩进；换行风格差异会自动兼容）
+3. 修改：
+   - 单处修改 -> mcp__read-file-server__edit_file（oldString/newString）
+   - 多处修改 -> mcp__read-file-server__edit_file 的 edits 数组（原子：失败整体不写盘）
+   - oldString 从第 1 步读到的内容里**原样复制**（含空格、缩进；换行风格差异会自动兼容）
 4. 必要时再 read_file 验证修改结果
 ```
 
@@ -120,16 +122,26 @@ description: 在文件加密软件（天锐绿盾 / IP-Guard / 亿赛通 / 深�
 | 参数 | 类型 | 必填 | 默认 | 说明 |
 |------|------|------|------|------|
 | `path` | string | ✅ | - | 文件绝对路径 |
-| `oldString` | string | ✅ | - | 要替换的原内容，必须**精确匹配** |
-| `newString` | string | ✅ | - | 替换后的新内容 |
-| `useRegex` | boolean | ❌ | false | true 时 oldString 当正则，可用 `$1 $2` 引用捕获组 |
+| `oldString` | string | 单次模式✅ | - | 要替换的原内容，必须**精确匹配**（换行风格差异已自动兼容） |
+| `newString` | string | 单次模式✅ | - | 替换后的新内容 |
+| `edits` | array | 批量模式✅ | - | 批量原子编辑：`[{oldString, newString, replaceAll?}]` 按序应用，**任一条目失败则整体不写盘**（不会产生半改状态）。一次完成多处修改必须用它，不要逐条调用 |
+| `useRegex` | boolean | ❌ | false | true 时 oldString 当正则（单次模式），可用 `$1 $2` 引用捕获组；默认启用多行模式（`^`/`$` 按行锚定） |
 | `replaceAll` | boolean | ❌ | false | true 时替换所有匹配项；false 时仅替换第一处 |
 | `ignoreCase` | boolean | ❌ | false | 是否忽略大小写（仅字符串模式生效） |
 
 ### 常见用法
 - **单点替换**：`useRegex=false, replaceAll=false`（默认）
 - **批量替换**：`useRegex=true, replaceAll=true`（如改命名）
+- **多处修改**：`edits` 数组（如重命名+改值+删行一次完成，失败自动整体回滚）
 - **正则提取后重组**：`useRegex=true, newString` 里用 `$1` `$2`
+
+### 实战避坑（来自真实使用反馈）
+
+1. **换行差异已自动兼容，无需关心 CRLF/LF**：oldString 用 LF 匹配 CRLF 文件（或相反）均可命中，newString 行尾自动跟随文件风格。**不要**再为此绕道写 Node 补丁脚本手工归一
+2. **oldString 含反引号 `` ` `` 与 `${}` 直接原样传入**：MCP 参数走 JSON 传输，无 JS 模板字面量的转义层级问题；同样不要绕道脚本（脚本里转义极易写错）
+3. **多处修改必须用 `edits` 批量模式**：逐条调用时若中途失败，前面条目已写盘会产生「半改状态」，后续按原内容构造的 oldString 必然失配；`edits` 原子模式要么全成要么不动。**批量条目按序应用**：前面条目的 newString 会成为后续条目的匹配环境，请按文件现状顺序构造（如 A 改为 B 后，后条可用 B 做锚点）
+4. **oldString 带足上下文保证唯一**：短 oldString 命中多处时工具会警告（如 `替换 1/2 处`），此时加长上下文（含前后行）唯一定位；超长行（如记忆表格行）优先选行内独有片段做锚点
+5. **匹配失败看诊断**：失败信息会附「可能相关的行」及相似度，直接对照检查空白/缩进/字符差异，不要盲目重试；正则模式报错时注意 oldString 正则里 `$` 需写成 `\$`（如匹配字面 `$1`），而 newString 里的 `$1` 是捕获组引用原样保留
 
 ---
 

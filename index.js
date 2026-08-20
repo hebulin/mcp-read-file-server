@@ -475,26 +475,119 @@ function eolInsensitiveReplace(original, oldString, replacement, replaceAll, ign
   return { updated, count: positions.length };
 }
 
+/**
+ * 匹配失败时的相似行诊断：在文件中找出与 oldString 首行（或整体）最相似的行，
+ * 输出行号与原文，帮助 Agent 快速定位「看起来一样实际差个空白/字符」的位置。
+ * 诊断方式：按公共 8-gram 计数相似度（无依赖的轻量实现），返回最多 3 条候选。
+ */
+function diagnoseNoMatch(original, oldString) {
+  // 取 oldString 的首行做行级比对（多数失败源于首行定位错误）
+  const firstLine = oldString.split(/\r?\n/)[0].trim();
+  if (!firstLine || firstLine.length < 6) return "";
+  const grams = new Set();
+  const N = 8;
+  for (let i = 0; i + N <= firstLine.length; i++) grams.add(firstLine.slice(i, i + N));
+  if (!grams.size) return "";
+  const lines = original.split(/\r?\n/);
+  let best = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+    let hit = 0;
+    for (let j = 0; j + N <= line.length; j++) {
+      if (grams.has(line.slice(j, j + N))) hit++;
+    }
+    const denom = Math.max(grams.size, Math.ceil(line.trim().length / N));
+    const sim = hit / denom;
+    if (sim > 0.25) best.push({ line: i + 1, sim, text: line.trim().slice(0, 120) });
+  }
+  best.sort((a, b) => b.sim - a.sim);
+  best = best.slice(0, 3);
+  if (!best.length) return "";
+  return "\n可能相关的行（相似度排序，请对照检查空白/缩进/字符差异）:\n" +
+    best.map((b) => "  第 " + b.line + " 行 (相似度 " + Math.round(b.sim * 100) + "%): " + b.text).join("\n");
+}
+
+/**
+ * 对文本应用一次替换（edit_file 单次模式与批量模式的每个条目共用）。
+ * 两级匹配：①字节级精确匹配 ②换行归一化兜底（CRLF/LF 差异）。
+ * 返回 { ok, updated, count, eolAdapted, error, diagnose }；失败时 error 带原因，
+ * diagnose 带相似行诊断（仅字符串模式且完全无命中时提供）。
+ */
+function applySingleEdit(original, oldString, newString, useRegex, replaceAll, ignoreCase) {
+  // 替换文本统一按文件主导行尾风格写入（调用方已归一 newString）
+  let matcher = null;
+  if (useRegex) {
+    try {
+      // 正则模式默认附加 m 标志：^/$ 按行锚定（Agent 常用行级正则习惯），JS 无内联标志无法由调用方自行开启
+      matcher = new RegExp(oldString, ((replaceAll ? "g" : "") + "m" + (ignoreCase ? "i" : "")));
+    } catch (e) {
+      return { ok: false, error: "正则表达式无效: " + e.message };
+    }
+  }
+  if (useRegex) {
+    // 计数与替换均带 m 标志，保持与构造 matcher 时一致
+    const globalMatcher = new RegExp(matcher.source, "gm" + (ignoreCase ? "i" : ""));
+    const matches = original.match(globalMatcher);
+    const count = matches ? matches.length : 0;
+    if (count === 0) return { ok: false, error: "正则未匹配到内容", count: 0 };
+    const replaceMatcher = replaceAll ? globalMatcher : new RegExp(matcher.source, "m" + (ignoreCase ? "i" : ""));
+    return { ok: true, updated: original.replace(replaceMatcher, newString), count, eolAdapted: false };
+  }
+  if (oldString === "") {
+    return { ok: false, error: "oldString 不能为空字符串" };
+  }
+  // 第一优先：原样精确匹配（字节级一致，最安全）
+  const hay = ignoreCase ? original.toLowerCase() : original;
+  const needle = ignoreCase ? oldString.toLowerCase() : oldString;
+  let idx = 0, exactCount = 0;
+  while ((idx = hay.indexOf(needle, idx)) !== -1) { exactCount++; idx += needle.length; }
+  if (exactCount > 0) {
+    let updated;
+    if (replaceAll) {
+      const esc = oldString.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      // 用函数替换避免 newString 中的 $& $1 等被误解析为替换模式
+      updated = original.replace(new RegExp(esc, ignoreCase ? "gi" : "g"), () => newString);
+    } else {
+      const pos = hay.indexOf(needle);
+      updated = original.slice(0, pos) + newString + original.slice(pos + oldString.length);
+    }
+    return { ok: true, updated, count: exactCount, eolAdapted: false };
+  }
+  // 第二优先：换行符兼容匹配。文件是 CRLF 而 oldString 用 LF（或相反）时，
+  // 字节级比对必然失败，归一换行后再匹配，命中即记为换行适配替换
+  const adapted = eolInsensitiveReplace(original, oldString, newString, replaceAll, ignoreCase);
+  if (adapted) {
+    return { ok: true, updated: adapted.updated, count: adapted.count, eolAdapted: true };
+  }
+  return { ok: false, error: "未找到匹配内容", count: 0, diagnose: diagnoseNoMatch(original, oldString) };
+}
+
 // 注册 edit_file 工具（精确替换，替代受加密影响的 Edit/MultiEdit）
 server.tool(
   "edit_file",
-  "对文件内容做精确字符串或正则替换后写回（明文）。字符串匹配自动兼容 CRLF/LF 换行差异，替换文本行尾自动跟随文件主导风格。加密软件环境下内置 Edit/MultiEdit 直写会破坏加密，本工具用 Node.js fs 读改写，自动加密落盘。替代内置 Edit/MultiEdit 工具。",
+  "对文件内容做精确字符串或正则替换后写回（明文）。支持两种形态：①单次替换（oldString/newString）；②批量原子编辑（edits 数组，按序应用，任一条目失败则整体不写盘，避免半改状态）。字符串匹配自动兼容 CRLF/LF 换行差异，替换文本行尾自动跟随文件主导风格。加密软件环境下内置 Edit/MultiEdit 直写会破坏加密，本工具用 Node.js fs 读改写，自动加密落盘。替代内置 Edit/MultiEdit 工具。",
   {
     path: z.string().describe("文件路径，支持相对路径或绝对路径"),
-    oldString: z.string().describe("要被替换的原字符串。useRegex=true 时作为正则表达式"),
-    newString: z.string().describe("替换后的字符串。正则模式下可用 $1 $2 等捕获组引用"),
-    useRegex: z.boolean().optional().describe("是否将 oldString 当作正则表达式，默认 false（纯字符串匹配）"),
-    replaceAll: z.boolean().optional().describe("是否替换全部匹配项，默认 false 仅替换第一处"),
+    oldString: z.string().optional().describe("单次模式必填：要被替换的原字符串。useRegex=true 时作为正则表达式"),
+    newString: z.string().optional().describe("单次模式必填：替换后的字符串。正则模式下可用 $1 $2 等捕获组引用"),
+    edits: z.array(z.object({
+      oldString: z.string().describe("要被替换的原字符串（批量条目，不支持正则）"),
+      newString: z.string().describe("替换后的字符串（批量条目）"),
+      replaceAll: z.boolean().optional().describe("是否替换全部匹配项，默认 false 仅替换第一处"),
+    })).optional().describe("批量原子编辑模式：多个替换按序应用，任一条目未匹配则整体不写盘。适合一次完成多处修改（替代 MultiEdit）"),
+    useRegex: z.boolean().optional().describe("单次模式：是否将 oldString 当作正则表达式，默认 false（纯字符串匹配）"),
+    replaceAll: z.boolean().optional().describe("单次模式：是否替换全部匹配项，默认 false 仅替换第一处"),
     ignoreCase: z.boolean().optional().describe("是否忽略大小写，默认 false。仅在非正则的字符串模式下生效"),
   },
-  async ({ path: filePath, oldString, newString, useRegex, replaceAll, ignoreCase }) => {
+  async ({ path: filePath, oldString, newString, edits, useRegex, replaceAll, ignoreCase }) => {
     try {
       // readFileContent 会剥离 BOM 并记录，写回时补回，避免 oldString 匹配首行失败
       const readResult = readFileContent(filePath);
       if (!readResult.ok) {
         return { content: [{ type: "text", text: "❌ " + readResult.error }], isError: true };
       }
-      const original = readResult.content;
+      let original = readResult.content;
       const hasBom = readResult.hasBom;
       // 非 UTF-8 防护：GBK 等编码按 UTF-8 读入会产生大量 U+FFFD，此时做任何替换再写回，
       // 原始字节信息会永久丢失（不可逆损坏）。检测到即拒绝编辑并明确提示。
@@ -504,70 +597,67 @@ server.tool(
           isError: true,
         };
       }
-      // 文件主导换行风格：CRLF 文件写入的替换文本也转成 CRLF，保持文件风格统一
+      // 形态分派：edits 数组走批量原子模式；否则要求 oldString/newString 成对
+      const isBatch = Array.isArray(edits) && edits.length > 0;
+      if (!isBatch && (oldString === undefined || newString === undefined)) {
+        return { content: [{ type: "text", text: "❌ 参数缺失：请提供 oldString+newString（单次替换），或 edits 数组（批量原子编辑）" }], isError: true };
+      }
+      // 文件主导换行风格：所有替换文本统一转成该风格（CRLF 文件写入 CRLF，保持风格统一）
       const fileEol = detectEol(original);
-      const normalizedNew = normalizeEol(newString, fileEol);
-      let matcher;
-      if (useRegex) {
-        try {
-          // 正则模式默认附加 m 标志：^/$ 按行锚定（Agent 常用行级正则习惯），JS 无内联标志无法由调用方自行开启
-          const flags = (replaceAll ? "g" : "") + "m" + (ignoreCase ? "i" : "");
-          matcher = new RegExp(oldString, flags);
-        } catch (e) {
-          return { content: [{ type: "text", text: "❌ 正则表达式无效: " + e.message }], isError: true };
-        }
-      }
-      let count;
-      let updated;
-      let eolAdapted = false; // 是否触发了换行符兼容替换
-      if (useRegex) {
-        // 计数与替换均带 m 标志，保持与构造 matcher 时一致
-        const globalMatcher = new RegExp(matcher.source, "gm" + (ignoreCase ? "i" : ""));
-        const matches = original.match(globalMatcher);
-        count = matches ? matches.length : 0;
-        const replaceMatcher = replaceAll ? globalMatcher : new RegExp(matcher.source, "m" + (ignoreCase ? "i" : ""));
-        updated = original.replace(replaceMatcher, normalizedNew);
-      } else {
-        if (oldString === "") {
-          return { content: [{ type: "text", text: "❌ oldString 不能为空字符串" }], isError: true };
-        }
-        // 第一优先：原样精确匹配（字节级一致，最安全）
-        let idx = 0, c = 0;
-        const hay = ignoreCase ? original.toLowerCase() : original;
-        const needle = ignoreCase ? oldString.toLowerCase() : oldString;
-        while ((idx = hay.indexOf(needle, idx)) !== -1) { c++; idx += needle.length; }
-        count = c;
-        if (count > 0) {
-          if (replaceAll) {
-            const esc = oldString.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-            // 用函数替换避免 newString 中的 $& $1 等被误解析为替换模式
-            updated = original.replace(new RegExp(esc, ignoreCase ? "gi" : "g"), () => normalizedNew);
-          } else {
-            const pos = hay.indexOf(needle);
-            updated = original.slice(0, pos) + normalizedNew + original.slice(pos + oldString.length);
+      const toFileEol = (s) => normalizeEol(s, fileEol);
+
+      // ---------- 批量原子模式：先全部校验再统一写盘，杜绝半改状态 ----------
+      if (isBatch) {
+        let content = original;
+        let total = 0;
+        const applied = [];
+        // 全部条目按序在内存中应用；任一失败立即返回，文件保持原样
+        for (let i = 0; i < edits.length; i++) {
+          const item = edits[i];
+          const r = applySingleEdit(content, item.oldString, toFileEol(item.newString), false, item.replaceAll === true, false);
+          if (!r.ok) {
+            return {
+              content: [{
+                type: "text",
+                text: "❌ 批量编辑第 " + (i + 1) + "/" + edits.length + " 条失败: " + r.error + "\n已中止，文件未做任何修改（原子模式，前面条目也不会写入）: " + filePath +
+                  (r.diagnose || "") +
+                  "\n提示：批量条目按顺序应用，前面条目的 newString 会改变后续条目的匹配环境，请按文件现状顺序构造。",
+              }],
+              isError: true,
+            };
           }
-        } else {
-          // 第二优先：换行符兼容匹配。文件是 CRLF 而 oldString 用 LF（或相反）时，
-          // 字节级比对必然失败，这里归一换行后再匹配，命中即记为换行适配替换
-          const adapted = eolInsensitiveReplace(original, oldString, normalizedNew, replaceAll, ignoreCase);
-          if (adapted) {
-            count = adapted.count;
-            updated = adapted.updated;
-            eolAdapted = true;
-          } else {
-            count = 0;
-            updated = original;
+          if (r.updated === content) {
+            return {
+              content: [{ type: "text", text: "❌ 批量编辑第 " + (i + 1) + "/" + edits.length + " 条替换后内容无变化（newString 与原文相同），已中止: " + filePath }],
+              isError: true,
+            };
           }
+          content = r.updated;
+          total += r.count;
+          applied.push("#" + (i + 1) + " 替换 " + (item.replaceAll === true ? r.count : 1) + "/" + r.count + " 处");
         }
-      }
-      if (count === 0) {
+        if (content === original) {
+          return { content: [{ type: "text", text: "⚠️ 批量编辑应用后内容无变化，文件未修改: " + filePath }] };
+        }
+        fs.writeFileSync(filePath, (hasBom ? "\uFEFF" : "") + content, "utf-8");
         return {
-          content: [{ type: "text", text: "⚠️ 未找到匹配内容，文件未修改。请检查 oldString（或正则）是否正确: " + filePath + "\n提示：若内容本身无误，请确认文件与 oldString 的换行风格（CRLF/LF）及空白字符是否一致。" }],
+          content: [{ type: "text", text: "✅ 批量编辑成功: " + filePath + "\n共 " + edits.length + " 条，" + total + " 处替换\n" + applied.join("\n") }],
+        };
+      }
+
+      // ---------- 单次模式（原行为） ----------
+      const normalizedNew = toFileEol(newString);
+      const r = applySingleEdit(original, oldString, normalizedNew, useRegex === true, replaceAll === true, ignoreCase === true);
+      if (!r.ok) {
+        return {
+          content: [{ type: "text", text: "⚠️ " + r.error + "，文件未修改。请检查 oldString（或正则）是否正确: " + filePath + (r.diagnose || "") + "\n提示：换行风格（CRLF/LF）已自动兼容；重点检查空格、缩进、字符是否与原文完全一致。" }],
           isError: true,
         };
       }
+      const count = r.count;
+      const updated = r.updated;
       let warning = "";
-      if (eolAdapted) {
+      if (r.eolAdapted) {
         warning = "\nℹ️ 换行符已自动适配：oldString 与文件换行风格不一致（CRLF/LF），已按换行归一化匹配完成替换。";
       }
       if (!replaceAll && count > 1) {
