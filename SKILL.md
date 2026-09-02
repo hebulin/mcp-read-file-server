@@ -40,6 +40,9 @@ description: 在文件加密软件（天锐绿盾 / IP-Guard / 亿赛通 / 深�
 | 创建目录 | （无） | `mcp__read-file-server__create_directory` |
 | 查文件信息 | （无） | `mcp__read-file-server__file_info` |
 | 健康检查 | （无） | `mcp__read-file-server__check_status` |
+| 查看环境探测结果 | （无） | `mcp__read-file-server__encryption_profile` |
+| 重新探测环境（策略变更后） | （无） | `mcp__read-file-server__refresh_profile` |
+| 手动标注扩展名保持加密/明文 | （无） | `mcp__read-file-server__mark_extension` |
 
 > **强约束**：在加密环境下，**禁止使用** `Read/Write/Edit/MultiEdit/Grep/Glob/LS` 内置工具与 `Bash` 的 `cp/mv/rm` 文件操作--它们会读到密文、写出密文或破坏加密结构。
 
@@ -147,15 +150,17 @@ description: 在文件加密软件（天锐绿盾 / IP-Guard / 亿赛通 / 深�
 
 ## 六、注意事项
 
-1. **路径**：用**绝对路径**最稳（如 `D:/AiJiamiToolsPlugins/...`），相对路径以 MCP Server 启动目录为基准
-2. **`edit_file` 前必读**：必须先 `read_file` 拿到明文，再从原文里**原样复制** `oldString`，否则会因为空格/缩进不匹配而失败
-3. **换行风格无需担心**：文件是 CRLF 而 `oldString` 是 LF（或相反）时，`edit_file` 会自动归一换行后匹配；`newString` 行尾也会自动跟随文件主导风格，不会产生混行
-4. **`write_file` 是覆盖写**：会清空原文件再写入，重要文件修改前建议先 `read_file` 备份内容
-5. **`search_files` / `find_files` 自动跳过**：`node_modules`、`.git`、`target`、`build`、`dist`、`.svn`、`bin`、`obj`、`out`、`vendor` 与 `.` 开头的隐藏文件/目录；`search_files` 另跳过二进制与超过 5MB 的文件
-6. **大批量搜索**：用 `maxResults` 控制返回数量，避免一次性返回过多结果
-7. **工具调用顺序**：复杂任务先 `check_status`（可传 path 实测解密）确认 MCP 正常，再正式操作
-8. **`remove_path` 不可恢复**：递归删除前建议先 `list_directory` 确认内容
-9. **`read_files` 路径含逗号时必须传数组**：Windows 路径可合法包含英文逗号，逗号分隔字符串形式会被错误切分
+1. **环境自适应（v1.7.0+）**：写工具（write_file/edit_file/copy_path/move_path）已内置扩展名分类感知，unsafe 扩展名（直写会变不可解密密文的类型，如部分机器的 .scss/.css）自动走 safeWrite 明文落盘，**无需任何特殊处理**；策略变更或换电脑后探测缓存自动失效重探，也可手动调 `refresh_profile`
+2. **写入后实时重分类（v1.8.0+）**：直写完成后会用外部进程实测磁盘字节，发现密文自动重分类该扩展名并立即重写为明文（返回中会有「已自动重分类」提示）；已知 safe/protected 扩展名也会复测，目录级策略差异可自动纠正。需要**保持加密**的扩展名（如公司受控的 .java），用 `mark_extension(".java", "protected")` 标注后直写保持加密并跳过自动纠正
+3. **路径**：用**绝对路径**最稳（如 `D:/AiJiamiToolsPlugins/...`），相对路径以 MCP Server 启动目录为基准
+4. **`edit_file` 前必读**：必须先 `read_file` 拿到明文，再从原文里**原样复制** `oldString`，否则会因为空格/缩进不匹配而失败
+5. **换行风格无需担心**：文件是 CRLF 而 `oldString` 是 LF（或相反）时，`edit_file` 会自动归一换行后匹配；`newString` 行尾也会自动跟随文件主导风格，不会产生混行
+6. **`write_file` 是覆盖写**：会清空原文件再写入，重要文件修改前建议先 `read_file` 备份内容
+7. **`search_files` / `find_files` 自动跳过**：`node_modules`、`.git`、`target`、`build`、`dist`、`.svn`、`bin`、`obj`、`out`、`vendor` 与 `.` 开头的隐藏文件/目录；`search_files` 另跳过二进制与超过 5MB 的文件
+8. **大批量搜索**：用 `maxResults` 控制返回数量，避免一次性返回过多结果
+9. **工具调用顺序**：复杂任务先 `check_status`（可传 path 实测解密）确认 MCP 正常，再正式操作
+10. **`remove_path` 不可恢复**：递归删除前建议先 `list_directory` 确认内容
+11. **`read_files` 路径含逗号时必须传数组**：Windows 路径可合法包含英文逗号，逗号分隔字符串形式会被错误切分
 
 ---
 
@@ -163,6 +168,9 @@ description: 在文件加密软件（天锐绿盾 / IP-Guard / 亿赛通 / 深�
 
 | 现象 | 可能原因 | 解决方案 |
 |------|----------|----------|
+| 写入 .scss/.css 后文件显示乱码（密文） | 该扩展名为 unsafe 且 safeWrite 未生效（缓存过期/策略变更） | 调 `refresh_profile` 重探后重写；用 `encryption_profile` 确认分类与可用进程；1.8.0+ 写入后会自动实测纠正，若仍乱码用 `mark_extension(".scss", "unsafe")` 强制明文 |
+| 写入 .java 后被自动转明文（需要保持加密） | 1.8.0+ 写入后检测发现密文自动纠正为明文 | 用 `mark_extension(".java", "protected")` 标注保持加密，后续直写不再自动纠正 |
+| 写工具提示「safeWrite 失败，已回退直接写入」 | 无可用外部进程或全部组合验证失败 | 调 `refresh_profile`；确认 MCP Server 进程可 spawn powershell/cmd；删除乱码文件后重写 |
 | 读到的还是密文/乱码 | Node.js 不在加密软件白名单 | 联系管理员把 `node.exe` 加入白名单 |
 | `mcp__read-file-server__*` 工具全部不可见 | MCP Server 未配置或未启动 | 见 `README.md` 配置 `.mcp.json` |
 | `edit_file` 报"未找到匹配内容" | `oldString` 拼写、缩进不对（换行 CRLF/LF 差异与 BOM 已自动兼容） | 重新 `read_file` 复制原文，**不要凭记忆写**；重点检查空格与缩进 |

@@ -25,9 +25,26 @@
  *   - create_directory   递归创建目录
  *   - file_info          查询文件/目录信息
  *   - check_status       检查工具运行状态（可实测解密能力）
+ *   - encryption_profile 查看环境探测结果（扩展名分类/可用进程/最佳组合）
+ *   - refresh_profile    强制重新探测环境并更新缓存
+ *   - mark_extension     手动标注扩展名写入策略（protected 保持加密 / unsafe 保持明文 / clear 清除标注）
+ *
+ * 环境自适应（1.7.0）：加密软件按目标扩展名决定是否透明加密且各机策略不同，
+ * 本 Server 首次启动时自动探测本机扩展名分类（safe/protected/unsafe）与可用
+ * 外部进程（powershell/cmd/robocopy 等），unsafe 扩展名走 safeWrite 中转落盘，
+ * 探测结果按 machineId 缓存到 ~/.mcp-encryption-profile.json，换机自动重探。
+ *
+ * 写入后实时重分类（1.8.0）：启动探测只给先验分类，且 Node.js 白名单读回无法
+ * 区分「真受控」与「伪受控」。所有直写路径完成后用外部进程读磁盘原始字节实测：
+ * 磁盘为密文（命中 %TSD 魔数）→ 自动将该扩展名重分类为 encrypted 并立即用
+ * safeWrite 重写为明文；磁盘为明文 → 重分类为 safe。用户可用 mark_extension
+ * 手动标注 protected（保持加密，跳过自动纠正）或 unsafe（强制 safeWrite）。
  */
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
+const crypto = require("crypto");
+const { spawnSync } = require("child_process");
 const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
 const { z } = require("zod");
@@ -230,6 +247,749 @@ function readFilePrefix(filePath, budgetBytes) {
   }
 }
 
+// ==================== 环境自适应探测（加密策略感知，1.7.0 新增） ====================
+// 背景：加密软件按「目标文件扩展名」决定是否透明加密，且不同电脑策略不同：
+//   safe      写入后磁盘为明文（任何设备可读）
+//   protected 写入后磁盘为密文，但 Node.js 白名单读回 == 写入内容（本机自动解密）
+//   unsafe    写入后磁盘为密文，且 Node.js 读回 != 写入内容（本机也无法解密，乱码）
+// unsafe 扩展名的写入必须走 safeWrite：先写安全扩展名临时文件（磁盘明文），
+// 再由可用外部进程（非白名单进程，复制不触发透明加密）复制到目标路径。
+// 探测结果按 machineId 缓存，换电脑/缓存过期自动重新探测，不硬编码任何结论。
+
+// 探测结果缓存文件（绑定机器，machineId 不一致即重新探测）
+const PROFILE_CACHE_PATH = path.join(os.homedir(), ".mcp-encryption-profile.json");
+// 缓存有效期：30 天（加密策略可能被管理员调整，过期自动重探）
+const PROFILE_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+// 缓存结构版本：结构变更时递增，旧缓存自动作废
+// v2：新增 encryptedExtensions（写入后实测磁盘为密文的扩展名）、
+//     userProtectedExtensions（用户手动标注保持加密）、postWriteDetectionEnabled
+const PROFILE_CACHE_VERSION = 2;
+// 候选「安全扩展名」探测清单：仅为探测对象，实测分类因机而异，不做任何硬编码结论
+const PROBE_SAFE_CANDIDATES = [".tmp", ".md", ".txt", ".log", ".dat", ".bak", ".cache", ".temp", ".mcp_tmp"];
+// 候选「其他常见扩展名」探测清单：用于完整分类与交叉验证时寻找 unsafe 样例
+const PROBE_OTHER_CANDIDATES = [".java", ".xml", ".js", ".ts", ".py", ".html", ".json", ".scss", ".css", ".less", ".yaml", ".sql"];
+// 探测内容：长度刻意避开 4096/8192 等加密块对齐值，
+// 使「物理大小 != 内容字节数」成为可靠的密文信号（TSD 密文按固定块大小落盘）
+const PROBE_CONTENT = "mcp-encryption-probe|" + "0123456789abcdef".repeat(9) + "|eol\n";
+const PROBE_BYTES = Buffer.byteLength(PROBE_CONTENT, "utf-8");
+const PROBE_HEX_PREFIX = Buffer.from(PROBE_CONTENT, "utf-8").subarray(0, 16).toString("hex");
+// TSD 加密文件头魔数（%TSD = 25 54 53 44），作为外部进程读原始字节时的密文佐证
+const TSD_MAGIC_HEX = "25545344";
+// 候选外部进程清单：exe 仅作探测对象，可用性实测决定（部分机器 MCP Server 可能无法 spawn）
+const PROCESS_CANDIDATES = [
+  { id: "powershell", exe: "powershell.exe", canReadBytes: true },
+  { id: "pwsh", exe: "pwsh.exe", canReadBytes: true },
+  { id: "cmd", exe: "cmd.exe", canReadBytes: false },
+  { id: "robocopy", exe: "robocopy.exe", canReadBytes: false },
+  { id: "cscript", exe: "cscript.exe", canReadBytes: false },
+];
+// 探测文件命名计数器，保证同一临时目录内文件名唯一
+let probeFileCounter = 0;
+
+/**
+ * 计算机器指纹：hostname + username 的 SHA-256 截断值。
+ * 用于绑定探测缓存，换电脑（或换用户）时缓存自动失效并重新探测。
+ */
+function getMachineId() {
+  let username = "";
+  try { username = os.userInfo().username; } catch (e) { /* 取不到用户名时仅按 hostname 区分 */ }
+  return crypto.createHash("sha256").update(os.hostname() + "|" + username).digest("hex").slice(0, 16);
+}
+
+/**
+ * 读取探测结果缓存。校验结构版本、machineId 与有效期，任一不满足返回 null（触发重探）。
+ * 缓存文件损坏/不可读时同样返回 null，不影响启动。
+ */
+function loadProfileCache() {
+  try {
+    const raw = fs.readFileSync(PROFILE_CACHE_PATH, "utf-8");
+    const p = JSON.parse(raw);
+    if (!p || p.version !== PROFILE_CACHE_VERSION) return null;
+    if (p.machineId !== getMachineId()) return null; // 换电脑/换用户
+    if (!p.detectedAt || Date.now() - new Date(p.detectedAt).getTime() > PROFILE_CACHE_TTL_MS) return null;
+    if (!Array.isArray(p.safeExtensions) || !Array.isArray(p.availableProcesses)) return null;
+    // v2 新增字段兜底初始化（防手工编辑缓存导致字段缺失）
+    if (!Array.isArray(p.encryptedExtensions)) p.encryptedExtensions = [];
+    if (!Array.isArray(p.userProtectedExtensions)) p.userProtectedExtensions = [];
+    if (p.postWriteDetectionEnabled === undefined) p.postWriteDetectionEnabled = true;
+    return p;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * 持久化探测结果到缓存文件（best-effort：写失败仅影响下次启动重探，不阻断运行）。
+ */
+function saveProfileCache(profile) {
+  try {
+    fs.writeFileSync(PROFILE_CACHE_PATH, JSON.stringify(profile, null, 2), "utf-8");
+  } catch (e) { /* 缓存写失败可忽略，下次启动重新探测 */ }
+}
+
+/**
+ * PowerShell 单引号字符串转义：单引号按 ''  doubling，防路径含引号时命令注入/断裂。
+ */
+function psQuote(p) {
+  return "'" + String(p).replace(/'/g, "''") + "'";
+}
+
+/**
+ * 通过外部进程（powershell/pwsh）读取文件磁盘原始字节的前 byteCount 字节（十六进制小写）。
+ * 外部进程不在加密软件白名单内，读到的是磁盘真实字节（密文文件即密文头部），
+ * 这是「磁盘是否密文」最可靠的判据。进程不可用/执行失败/输出异常时返回 null（未知），
+ * 调用方需退化为其他判据（物理大小对比、Node 读回对比）。
+ */
+function externalReadHexPrefix(procId, filePath, byteCount) {
+  const exe = procId === "pwsh" ? "pwsh.exe" : "powershell.exe";
+  const cmd = "$b=[System.IO.File]::ReadAllBytes(" + psQuote(filePath) + ");" +
+    "$n=[Math]::Min($b.Length," + byteCount + ");" +
+    "if($n -gt 0){[BitConverter]::ToString($b[0..($n-1)])}";
+  try {
+    const r = spawnSync(exe, ["-NoProfile", "-NonInteractive", "-Command", cmd], { timeout: 10000, windowsHide: true, encoding: "utf-8" });
+    if (r.error || r.status !== 0) return null; // EPERM/超时/策略拦截均按未知处理
+    const hex = String(r.stdout || "").trim().replace(/-/g, "").toLowerCase();
+    return /^[0-9a-f]*$/.test(hex) ? hex : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * cscript 复制脚本路径（懒初始化）：JScript 内容用安全扩展名临时文件落盘，
+ * 通过 //E:JScript 强制指定脚本引擎（不受临时文件扩展名限制）。
+ */
+let cscriptHelperPath = null;
+function getCscriptHelperPath() {
+  if (cscriptHelperPath && fs.existsSync(cscriptHelperPath)) return cscriptHelperPath;
+  const p = path.join(os.tmpdir(), "mcp-enc-copy-" + process.pid + ".tmp");
+  fs.writeFileSync(p, 'var f=new ActiveXObject("Scripting.FileSystemObject");f.CopyFile(WScript.Arguments(0),WScript.Arguments(1),true);', "utf-8");
+  cscriptHelperPath = p;
+  return p;
+}
+
+/**
+ * 用指定外部进程将 src 复制为 dst（dst 可不同名）。复制动作由非白名单进程执行，
+ * 不触发加密软件的透明加密，从而把「安全扩展名的明文临时文件」落到 unsafe 扩展名目标上。
+ * 各进程参数差异在内部抹平：robocopy 不支持改名（复制后由 fs.renameSync 改名，
+ * rename 不重写文件内容，不触发加密）；cmd 用 copy /y；cscript 走 JScript FileSystemObject。
+ * 失败抛出 Error（含进程退出码/错误信息），成功返回 undefined。
+ */
+function externalCopyFile(procId, src, dst) {
+  const opts = { timeout: 20000, windowsHide: true, encoding: "utf-8" };
+  if (procId === "powershell" || procId === "pwsh") {
+    const exe = procId === "powershell" ? "powershell.exe" : "pwsh.exe";
+    const r = spawnSync(exe, ["-NoProfile", "-NonInteractive", "-Command",
+      "Copy-Item -LiteralPath " + psQuote(src) + " -Destination " + psQuote(dst) + " -Force"], opts);
+    if (r.error) throw r.error;
+    if (r.status !== 0) throw new Error(procId + " 退出码 " + r.status + ": " + String(r.stderr || "").slice(0, 200));
+  } else if (procId === "cmd") {
+    // windowsVerbatimArguments：参数含空格时 Node 默认会再加一层引号，
+    // 导致 cmd /c 收到嵌套引号解析失败（"文件名、目录名或卷标语法不正确"）
+    const r = spawnSync("cmd.exe", ["/c", 'copy /y "' + src + '" "' + dst + '"'], Object.assign({}, opts, { windowsVerbatimArguments: true }));
+    if (r.error) throw r.error;
+    if (r.status !== 0) throw new Error("cmd 退出码 " + r.status + ": " + String(r.stderr || r.stdout || "").slice(0, 200));
+  } else if (procId === "robocopy") {
+    // robocopy 语义为「目录到目录 + 文件名」，不支持目标改名；退出码 0-7 均为成功
+    const r = spawnSync("robocopy.exe", [path.dirname(src), path.dirname(dst), path.basename(src),
+      "/NFL", "/NDL", "/NJH", "/NJS", "/NC", "/NS", "/NP"], opts);
+    if (r.error) throw r.error;
+    if (r.status === null || r.status >= 8) throw new Error("robocopy 退出码 " + r.status);
+    const copied = path.join(path.dirname(dst), path.basename(src));
+    if (path.resolve(copied) !== path.resolve(dst)) {
+      fs.renameSync(copied, dst); // 改名不落盘内容，安全
+    }
+  } else if (procId === "cscript") {
+    const r = spawnSync("cscript.exe", ["//nologo", "//E:JScript", getCscriptHelperPath(), src, dst], opts);
+    if (r.error) throw r.error;
+    if (r.status !== 0) throw new Error("cscript 退出码 " + r.status + ": " + String(r.stderr || r.stdout || "").slice(0, 200));
+  } else {
+    throw new Error("未知进程类型: " + procId);
+  }
+  if (!fs.existsSync(dst)) throw new Error(procId + " 复制后目标文件不存在");
+}
+
+/**
+ * 分类单个扩展名：在指定目录写入探测文件，通过三重交叉验证判断磁盘状态。
+ * 判定逻辑：
+ *   ① Node 读回 != 写入内容 → 必为密文且无法解密（unsafe）
+ *   ② 读回一致时，外部进程读磁盘原始字节 != 写入前缀（或命中 %TSD 魔数）→ protected
+ *   ③ 无字节读取器时退化用物理大小对比：stat.size != 内容字节数 → protected
+ *   ④ 以上均不命中 → safe（磁盘明文）
+ * readerProcId 为 null 时跳过方式②（进程不可用环境自动降级）。
+ */
+function classifyExtension(ext, readerProcId, probeDir) {
+  const dir = probeDir || os.tmpdir();
+  const f = path.join(dir, "mcp-cls-" + process.pid + "-" + (++probeFileCounter) + ext);
+  try {
+    fs.writeFileSync(f, PROBE_CONTENT, "utf-8");
+    let readBack = null;
+    try { readBack = fs.readFileSync(f, "utf-8"); } catch (e) { /* 读回失败按不可解密处理 */ }
+    let encrypted = readBack !== PROBE_CONTENT; // 判据①：读回不一致即密文（且不可解密）
+    if (!encrypted) {
+      if (readerProcId) {
+        // 判据②：磁盘原始字节对比（最可靠，通用）+ %TSD 魔数（佐证）
+        const hex = externalReadHexPrefix(readerProcId, f, 16);
+        if (hex !== null) {
+          encrypted = hex !== PROBE_HEX_PREFIX || hex.slice(0, 8) === TSD_MAGIC_HEX;
+        } else {
+          encrypted = isSizeAnomaly(f);
+        }
+      } else {
+        // 判据③：物理大小对比（无外部进程可用时的降级方案）
+        encrypted = isSizeAnomaly(f);
+      }
+    }
+    if (!encrypted) return "safe";
+    return readBack === PROBE_CONTENT ? "protected" : "unsafe";
+  } finally {
+    try { fs.rmSync(f, { force: true }); } catch (e) { /* 清理失败可忽略 */ }
+  }
+}
+
+/**
+ * 物理大小异常检测：探测内容长度刻意避开加密块对齐值，
+ * stat.size 与内容字节数不一致即说明落盘的是密文（TSD 密文按固定块大小落盘）。
+ */
+function isSizeAnomaly(filePath) {
+  try {
+    return fs.statSync(filePath).size !== PROBE_BYTES;
+  } catch (e) {
+    return false; // stat 失败按非密文处理（后续读回对比兜底）
+  }
+}
+
+/**
+ * 探测单个外部进程的复制能力：用已知安全扩展名的明文文件做一次真实复制，
+ * 并以 Node 读回验证复制产物内容一致（进程可能被策略拦截 spawn EPERM，或能启动但写盘受限）。
+ */
+function probeCopier(spec, safeExt, probeDir) {
+  const src = path.join(probeDir, "proc-src" + safeExt);
+  const dst = path.join(probeDir, "proc-dst" + safeExt);
+  try {
+    fs.writeFileSync(src, PROBE_CONTENT, "utf-8");
+    externalCopyFile(spec.id, src, dst);
+    return fs.readFileSync(dst, "utf-8") === PROBE_CONTENT;
+  } catch (e) {
+    return false;
+  } finally {
+    try { fs.rmSync(src, { force: true }); } catch (e) { /* 忽略 */ }
+    try { fs.rmSync(dst, { force: true }); } catch (e) { /* 忽略 */ }
+  }
+}
+
+/**
+ * 探测外部进程的原始字节读取能力：读一个已知明文文件的前 16 字节，
+ * 输出与期望前缀完全一致才认为可用（防止进程能启动但输出被策略篡改/为空）。
+ */
+function probeReader(procId, safeExt, probeDir) {
+  const f = path.join(probeDir, "reader" + safeExt);
+  try {
+    fs.writeFileSync(f, PROBE_CONTENT, "utf-8");
+    return externalReadHexPrefix(procId, f, 16) === PROBE_HEX_PREFIX;
+  } catch (e) {
+    return false;
+  } finally {
+    try { fs.rmSync(f, { force: true }); } catch (e) { /* 忽略 */ }
+  }
+}
+
+/**
+ * 交叉验证一组「安全扩展名 + 外部进程」组合：
+ * 将安全扩展名的明文文件经外部进程复制为 unsafe 扩展名目标，
+ * Node 读回与写入一致即证明该组合可在 unsafe 扩展名上落盘明文
+ * （unsafe 扩展名若被透明加密，Node 读回必不一致）。
+ */
+function crossValidateCombo(safeExt, procId, unsafeExt, probeDir) {
+  const src = path.join(probeDir, "xv-src" + safeExt);
+  const dst = path.join(probeDir, "xv-dst-" + (++probeFileCounter) + unsafeExt);
+  try {
+    fs.writeFileSync(src, PROBE_CONTENT, "utf-8");
+    externalCopyFile(procId, src, dst);
+    return fs.readFileSync(dst, "utf-8") === PROBE_CONTENT;
+  } catch (e) {
+    return false;
+  } finally {
+    try { fs.rmSync(src, { force: true }); } catch (e) { /* 忽略 */ }
+    try { fs.rmSync(dst, { force: true }); } catch (e) { /* 忽略 */ }
+  }
+}
+
+/**
+ * 环境探测主函数：在系统临时目录执行全部探测（不污染用户目录），返回 profile 对象。
+ * 流程：① 无进程粗分类安全候选，找到至少一个 safe 扩展名（供进程探测造文件）
+ *       ② 逐个探测外部进程的复制/字节读取能力
+ *       ③ 用字节读取器（若有）对全部候选扩展名做精确分类
+ *       ④ 交叉验证「safe 扩展名 × 可用进程」组合，确定 bestCombo
+ * 任何单步失败都降级处理，保证返回结构完整的 profile（可能为空列表）。
+ */
+function detectEnvironment() {
+  const profile = {
+    version: PROFILE_CACHE_VERSION,
+    machineId: getMachineId(),
+    detectedAt: new Date().toISOString(),
+    safeExtensions: [],
+    protectedExtensions: [],
+    unsafeExtensions: [],
+    encryptedExtensions: [],
+    userProtectedExtensions: [],
+    postWriteDetectionEnabled: true,
+    availableProcesses: [],
+    byteReader: null,
+    bestCombo: null,
+  };
+  let probeDir = null;
+  try {
+    probeDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-enc-probe-"));
+    // ① 粗分类安全候选（无字节读取器，用大小+读回对比），找到第一个 safe 即停
+    let firstSafe = null;
+    for (const ext of PROBE_SAFE_CANDIDATES) {
+      let cat;
+      try { cat = classifyExtension(ext, null, probeDir); } catch (e) { continue; }
+      if (cat === "safe") { firstSafe = ext; break; }
+    }
+    // ② 探测外部进程（需要 safe 扩展名造明文测试文件；无 safe 则进程探测无意义）
+    if (firstSafe) {
+      for (const spec of PROCESS_CANDIDATES) {
+        try {
+          if (probeCopier(spec, firstSafe, probeDir)) {
+            profile.availableProcesses.push({ id: spec.id, exe: spec.exe });
+            if (spec.canReadBytes && !profile.byteReader && probeReader(spec.id, firstSafe, probeDir)) {
+              profile.byteReader = spec.id;
+            }
+          }
+        } catch (e) { /* 单个进程探测失败不影响其他候选 */ }
+      }
+    }
+    // ③ 精确分类全部候选扩展名（有字节读取器时结果最可靠）
+    for (const ext of PROBE_SAFE_CANDIDATES.concat(PROBE_OTHER_CANDIDATES)) {
+      let cat;
+      try { cat = classifyExtension(ext, profile.byteReader, probeDir); } catch (e) { continue; }
+      if (cat === "safe") profile.safeExtensions.push(ext);
+      else if (cat === "protected") profile.protectedExtensions.push(ext);
+      else profile.unsafeExtensions.push(ext);
+    }
+    // ④ 交叉验证找最佳组合（无 unsafe 扩展名时无需 bestCombo，全部直写即可）
+    if (profile.unsafeExtensions.length && profile.availableProcesses.length && profile.safeExtensions.length) {
+      const unsafeExt = profile.unsafeExtensions[0];
+      let found = null;
+      for (const ext of profile.safeExtensions) {
+        for (const proc of profile.availableProcesses) {
+          try {
+            if (crossValidateCombo(ext, proc.id, unsafeExt, probeDir)) { found = { extension: ext, process: proc.id }; break; }
+          } catch (e) { /* 继续下一组合 */ }
+        }
+        if (found) break;
+      }
+      profile.bestCombo = found;
+    }
+  } catch (e) {
+    profile.detectError = e.message; // 整体探测失败也返回结构完整 profile
+  } finally {
+    if (probeDir) { try { fs.rmSync(probeDir, { recursive: true, force: true }); } catch (e) { /* 忽略 */ } }
+  }
+  return profile;
+}
+
+// 内存中缓存的活动 profile（避免每次写入都读盘/探测）
+let activeProfile = null;
+
+/**
+ * 获取当前环境 profile（懒加载）：优先内存，其次磁盘缓存（校验 machineId/有效期），
+ * 最后执行完整探测并落盘缓存。任何环节失败都返回结构完整的降级 profile，绝不阻断工具调用。
+ */
+function getProfile() {
+  if (activeProfile) return activeProfile;
+  const cached = loadProfileCache();
+  if (cached) { activeProfile = cached; return activeProfile; }
+  try {
+    activeProfile = detectEnvironment();
+    saveProfileCache(activeProfile);
+  } catch (e) {
+    // 探测整体异常时的兜底 profile：全部直写（保持 1.6.0 原始行为）
+    activeProfile = {
+      version: PROFILE_CACHE_VERSION, machineId: getMachineId(), detectedAt: new Date().toISOString(),
+      safeExtensions: [], protectedExtensions: [], unsafeExtensions: [],
+      encryptedExtensions: [], userProtectedExtensions: [], postWriteDetectionEnabled: true,
+      availableProcesses: [], byteReader: null, bestCombo: null, detectError: e.message,
+    };
+  }
+  // 防御：任何来源的 profile 都补齐 v2 字段（防手工编辑缓存/未来降级路径遗漏）
+  if (!Array.isArray(activeProfile.encryptedExtensions)) activeProfile.encryptedExtensions = [];
+  if (!Array.isArray(activeProfile.userProtectedExtensions)) activeProfile.userProtectedExtensions = [];
+  if (activeProfile.postWriteDetectionEnabled === undefined) activeProfile.postWriteDetectionEnabled = true;
+  return activeProfile;
+}
+
+/**
+ * 查询扩展名分类（写入前调用）：先查 profile 已知列表；未知扩展名按需即时探测，
+ * 结果并入 profile 并 best-effort 持久化（同一扩展名只探测一次）。
+ * targetDir 为目标文件所在目录：加密策略可能按目录范围生效（如系统临时目录常被排除），
+ * 按需探测优先在目标目录内进行（探测文件立即删除），不可写时回退系统临时目录。
+ */
+function classifyExtForWrite(ext, targetDir) {
+  const p = getProfile();
+  if (p.safeExtensions.indexOf(ext) !== -1) return "safe";
+  if (p.protectedExtensions.indexOf(ext) !== -1) return "protected";
+  if (p.unsafeExtensions.indexOf(ext) !== -1) return "unsafe";
+  let cat = "safe"; // 探测异常时默认直写（保持原始行为）
+  // 探测目录：优先目标目录（策略按目录生效时结果才准确），不可写则回退 os.tmpdir()
+  let probeDir = null;
+  if (targetDir) {
+    try { fs.accessSync(targetDir, fs.constants.W_OK); probeDir = targetDir; } catch (e) { /* 回退 tmpdir */ }
+  }
+  try {
+    cat = classifyExtension(ext, p.byteReader, probeDir);
+  } catch (e) { /* 探测失败按 safe 直写处理 */ }
+  const listKey = cat + "Extensions";
+  if (Array.isArray(p[listKey]) && p[listKey].indexOf(ext) === -1) {
+    p[listKey].push(ext);
+    saveProfileCache(p);
+  }
+  return cat;
+}
+
+/**
+ * 写入后实时检测目标文件的磁盘真实状态，并按结果更新扩展名分类（1.8.0 新增）。
+ * 动机：启动探测只能给出扩展名的先验分类，且 Node.js 白名单读回无法区分
+ * 「TSD 真受控」与「策略动态变化/目录级差异导致的伪受控」。写入后用外部进程
+ * 读磁盘原始字节是最可靠的实测判据，可即时纠正误分类：
+ *   - 磁盘字节 == 写入内容前缀 → 磁盘明文 → 该扩展名归入 safe
+ *   - 磁盘字节命中 %TSD 魔数   → 磁盘密文 → 该扩展名归入 encrypted
+ * 返回 { diskPlaintext, category: "safe"|"encrypted"|"unknown" }；
+ * 无字节读取器/无扩展名/检测异常时返回 unknown 且不改动分类。
+ */
+function detectDiskStateAfterWrite(filePath, expectedContent) {
+  try {
+    const profile = getProfile();
+    const ext = path.extname(filePath).toLowerCase();
+    if (!ext || !profile.byteReader) return { diskPlaintext: true, category: "unknown" };
+    const hex = externalReadHexPrefix(profile.byteReader, filePath, 16);
+    if (hex === null) return { diskPlaintext: true, category: "unknown" };
+    const expectedHex = Buffer.from(expectedContent, "utf-8").subarray(0, 16).toString("hex");
+    const isTsd = hex.slice(0, 8) === TSD_MAGIC_HEX;
+    if (!isTsd && hex === expectedHex) {
+      updateExtCategory(ext, "safe");
+      return { diskPlaintext: true, category: "safe" };
+    }
+    if (isTsd) {
+      updateExtCategory(ext, "encrypted");
+      return { diskPlaintext: false, category: "encrypted" };
+    }
+    return { diskPlaintext: true, category: "unknown" };
+  } catch (e) {
+    return { diskPlaintext: true, category: "unknown" };
+  }
+}
+
+/**
+ * 根据写入后的磁盘实测状态更新扩展名分类，并持久化到缓存（1.8.0 新增）。
+ * 从全部分类列表中移除该扩展名后写入目标列表：
+ *   safe      → safeExtensions（直写，磁盘明文）
+ *   encrypted → encryptedExtensions（磁盘密文，后续写入走 safeWrite 保持明文）
+ * 用户手动标注（userProtectedExtensions）优先级最高，自动重分类不会覆盖
+ * （标注为 protected 的扩展名不会被自动改判；标注为 unsafe 的扩展名已锁定
+ * 走 safeWrite，实测明文时也不回改，由用户用 mark_extension clear 解除）。
+ */
+function updateExtCategory(ext, newCategory) {
+  const p = getProfile();
+  if (!ext) return;
+  // 用户手动标注优先：protected 锁定保持加密，自动检测不得改判
+  if (Array.isArray(p.userProtectedExtensions) && p.userProtectedExtensions.indexOf(ext) !== -1) return;
+  for (const key of ["safeExtensions", "protectedExtensions", "unsafeExtensions", "encryptedExtensions"]) {
+    const arr = p[key];
+    if (Array.isArray(arr)) {
+      const idx = arr.indexOf(ext);
+      if (idx !== -1) arr.splice(idx, 1);
+    }
+  }
+  const listKey = newCategory === "safe" ? "safeExtensions" : "encryptedExtensions";
+  if (!Array.isArray(p[listKey])) p[listKey] = [];
+  if (p[listKey].indexOf(ext) === -1) p[listKey].push(ext);
+  saveProfileCache(p);
+}
+
+/**
+ * 写入后发现磁盘为密文时的拯救流程（1.8.0 新增）：
+ * 用 safeWrite 将同一份内容重新落盘为明文。返回 safeWriteFile 的结果。
+ * 调用方需保证已确认磁盘为密文（detectDiskStateAfterWrite.diskPlaintext === false）。
+ */
+function rescueToPlaintext(filePath, content) {
+  return safeWriteFile(filePath, content);
+}
+
+/**
+ * 写入策略决策（1.8.0 版）：优先级从高到低——
+ *   1. userProtectedExtensions（用户标注保持加密）→ direct 直写
+ *   2. encryptedExtensions（写入后实测磁盘密文）→ safe（safeWrite 保持明文）
+ *   3. unsafeExtensions（启动探测 unsafe）→ safe（safeWrite 保持明文）
+ *   4. 已知 safe/protected → direct 直写
+ *   5. 未知扩展名 → direct_then_verify（先直写，写后实测磁盘状态并自动重分类/纠正）
+ */
+function decideWriteStrategy(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (!ext) return { mode: "direct", category: "none" };
+  try {
+    const p = getProfile();
+    if (Array.isArray(p.userProtectedExtensions) && p.userProtectedExtensions.indexOf(ext) !== -1) {
+      return { mode: "direct", category: "user_protected" };
+    }
+    if (Array.isArray(p.encryptedExtensions) && p.encryptedExtensions.indexOf(ext) !== -1) {
+      return { mode: "safe", category: "encrypted" };
+    }
+    if (Array.isArray(p.unsafeExtensions) && p.unsafeExtensions.indexOf(ext) !== -1) {
+      return { mode: "safe", category: "unsafe" };
+    }
+    if (p.safeExtensions.indexOf(ext) !== -1) return { mode: "direct", category: "safe" };
+    if (p.protectedExtensions.indexOf(ext) !== -1) return { mode: "direct", category: "protected" };
+    return { mode: "direct_then_verify", category: "unknown" };
+  } catch (e) {
+    return { mode: "direct", category: "unknown" };
+  }
+}
+
+/**
+ * 构造 safeWrite 可用组合列表：bestCombo 优先，其后为全部 safe扩展名 × 可用进程 的笛卡尔积（去重）。
+ */
+function buildWriteCombos(profile) {
+  const combos = [];
+  if (profile.bestCombo) combos.push(profile.bestCombo);
+  for (const ext of profile.safeExtensions) {
+    for (const proc of profile.availableProcesses) {
+      combos.push({ extension: ext, process: proc.id });
+    }
+  }
+  const seen = new Set();
+  return combos.filter((c) => {
+    const k = c.extension + "|" + c.process;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
+/**
+ * 验证目标文件已按期望明文落盘：Node 读回与写入内容一致即视为明文
+ * （unsafe 扩展名若被透明加密成密文，Node 读回必不一致）。
+ * 有字节读取器时再叠加磁盘原始字节对比（双保险，防边缘情况）。
+ */
+function verifyPlaintextOnDisk(targetPath, expectedContent, profile) {
+  try {
+    if (fs.readFileSync(targetPath, "utf-8") !== expectedContent) return false;
+  } catch (e) {
+    return false;
+  }
+  if (profile && profile.byteReader) {
+    const hex = externalReadHexPrefix(profile.byteReader, targetPath, 16);
+    if (hex !== null) {
+      const expectedHex = Buffer.from(expectedContent, "utf-8").subarray(0, 16).toString("hex");
+      if (hex !== expectedHex || hex.slice(0, 8) === TSD_MAGIC_HEX) return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * safeWrite：把内容以明文落盘到 unsafe 扩展名目标。
+ * 流程（按组合逐个尝试，bestCombo 优先）：
+ *   1. fs.writeFileSync 写入 targetPath + 安全扩展名 的临时文件（磁盘明文）
+ *   2. 用该组合的外部进程复制临时文件到 targetPath（非白名单进程不触发透明加密）
+ *   3. 校验 targetPath 磁盘字节为明文
+ *   4. 清理临时文件
+ * 返回 { ok, via:{extension,process}, error }；全部组合失败返回 { ok:false, error }，
+ * 由调用方决定是否回退直写（不重删 targetPath，避免破坏已有文件）。
+ */
+function safeWriteFile(targetPath, content) {
+  const profile = getProfile();
+  const combos = buildWriteCombos(profile);
+  if (!combos.length) {
+    return { ok: false, error: "无可用组合（未探测到 safe 扩展名或可用外部进程）" };
+  }
+  const parent = path.dirname(targetPath);
+  const errors = [];
+  for (const combo of combos) {
+    const tmpPath = targetPath + combo.extension;
+    try {
+      if (parent && !fs.existsSync(parent)) fs.mkdirSync(parent, { recursive: true });
+      fs.writeFileSync(tmpPath, content, "utf-8");
+      externalCopyFile(combo.process, tmpPath, targetPath);
+      if (verifyPlaintextOnDisk(targetPath, content, profile)) {
+        return { ok: true, via: combo };
+      }
+      errors.push(combo.process + "+" + combo.extension + ": 落盘校验非明文");
+    } catch (e) {
+      errors.push(combo.process + "+" + combo.extension + ": " + e.message);
+    } finally {
+      try { fs.rmSync(tmpPath, { force: true }); } catch (e) { /* 忽略 */ }
+    }
+  }
+  return { ok: false, error: errors.join("；") || "全部组合失败" };
+}
+
+/**
+ * safeCopy 变体：供 copy_path / move_path 使用，把「已有源文件」复制到 unsafe 扩展名目标。
+ * 经白名单进程 cpSync 读出明文写入安全扩展名临时文件，再由外部进程复制到目标。
+ * 用 Buffer 对比验证（二进制安全）。返回结构同 safeWriteFile。
+ */
+function safeCopyFileTo(source, targetPath) {
+  const profile = getProfile();
+  const combos = buildWriteCombos(profile);
+  if (!combos.length) {
+    return { ok: false, error: "无可用组合（未探测到 safe 扩展名或可用外部进程）" };
+  }
+  const parent = path.dirname(targetPath);
+  const errors = [];
+  for (const combo of combos) {
+    const tmpPath = targetPath + combo.extension;
+    try {
+      if (parent && !fs.existsSync(parent)) fs.mkdirSync(parent, { recursive: true });
+      fs.cpSync(source, tmpPath, { force: true });
+      externalCopyFile(combo.process, tmpPath, targetPath);
+      // 读回对比（Buffer 级）：源经白名单读为明文，目标一致即明文落盘
+      let ok = false;
+      try { ok = fs.readFileSync(targetPath).equals(fs.readFileSync(source)); } catch (e) { /* 保持 false */ }
+      if (ok) return { ok: true, via: combo };
+      errors.push(combo.process + "+" + combo.extension + ": 落盘校验不一致");
+    } catch (e) {
+      errors.push(combo.process + "+" + combo.extension + ": " + e.message);
+    } finally {
+      try { fs.rmSync(tmpPath, { force: true }); } catch (e) { /* 忽略 */ }
+    }
+  }
+  return { ok: false, error: errors.join("；") || "全部组合失败" };
+}
+
+/**
+ * 编辑写回统一入口（edit_file 用）：unsafe/encrypted 扩展名走 safeWrite 保持磁盘明文，
+ * 其余直写。safeWrite 失败回退直写并标记 degraded（附带原因供调用方告警）。
+ * direct_then_verify（未知扩展名）与 direct 直写后执行写入后磁盘实测：
+ * 发现密文则自动重分类并立即用 safeWrite 重写为明文（autoCorrected 标记）。
+ * 返回 { ok, via, degraded, autoCorrected, correctedTo, error }。
+ */
+function writeBackWithStrategy(filePath, payload) {
+  const decision = decideWriteStrategy(filePath);
+  if (decision.mode === "safe") {
+    const r = safeWriteFile(filePath, payload);
+    if (r.ok) return { ok: true, via: r.via };
+    fs.writeFileSync(filePath, payload, "utf-8"); // 全部组合失败：回退直写并告警
+    return { ok: true, degraded: true, error: r.error };
+  }
+  fs.writeFileSync(filePath, payload, "utf-8");
+  // 写入后实测：未知扩展名（direct_then_verify）必测；已知 safe/protected 也复测
+  // （目录级策略差异或管理员调整策略时，启动探测结论可能已过期）。
+  // user_protected（用户手动标注保持加密）明确跳过：用户意图优先，不做自动纠正；
+  // 无字节读取器的环境检测必返回 unknown，自然无开销。
+  const p = getProfile();
+  if (p.postWriteDetectionEnabled && decision.category !== "user_protected") {
+    const ds = detectDiskStateAfterWrite(filePath, payload);
+    if (!ds.diskPlaintext) {
+      const sw = rescueToPlaintext(filePath, payload);
+      if (sw.ok) {
+        return { ok: true, autoCorrected: true, correctedTo: ds.category, via: sw.via };
+      }
+      return { ok: true, degraded: true, error: "写入后磁盘为密文且 safeWrite 纠正失败（" + sw.error + "）" };
+    }
+  }
+  return { ok: true };
+}
+
+/**
+ * 生成 profile 概要文本（encryption_profile / refresh_profile / check_status 共用）。
+ */
+function formatProfileSummary(p) {
+  const fmt = (arr) => arr.length ? arr.join(" ") : "（无）";
+  const procs = p.availableProcesses.map((x) => x.id).join(", ") || "（无）";
+  const lines = [
+    "机器指纹 machineId: " + p.machineId,
+    "探测时间: " + p.detectedAt,
+    "safe 扩展名（磁盘明文，直写）: " + fmt(p.safeExtensions),
+    "protected 扩展名（磁盘密文/白名单可解密，直写）: " + fmt(p.protectedExtensions),
+    "unsafe 扩展名（磁盘密文/不可解密，走 safeWrite）: " + fmt(p.unsafeExtensions),
+    "encrypted 扩展名（写入后实测磁盘密文，走 safeWrite）: " + fmt(p.encryptedExtensions || []),
+    "用户标注保持加密 userProtected: " + fmt(p.userProtectedExtensions || []),
+    "写入后实时检测: " + (p.postWriteDetectionEnabled !== false ? "开启" : "关闭"),
+    "可用外部进程: " + procs,
+    "磁盘字节读取器: " + (p.byteReader || "（无，退化为大小+读回对比）"),
+    "最佳组合 bestCombo: " + (p.bestCombo ? p.bestCombo.process + " + " + p.bestCombo.extension : "（无：无 unsafe 扩展名或无可用进程）"),
+    "缓存文件: " + PROFILE_CACHE_PATH,
+  ];
+  if (p.detectError) lines.push("探测异常: " + p.detectError);
+  return lines.join("\n");
+}
+
+// 注册 mark_extension 工具（手动标注扩展名写入策略）
+server.tool(
+  "mark_extension",
+  "手动标注扩展名的写入策略。protected=保持TSD加密直写（如 .java 这类需要保持加密状态的文档）；unsafe=强制走 safeWrite 保持明文（如 .scss）；clear=清除标注恢复自动探测。标注优先级高于自动探测与写入后重分类。",
+  {
+    extension: z.string().describe("扩展名，如 .java（可不带点，自动补全并转小写）"),
+    category: z.enum(["protected", "unsafe", "clear"]).describe("protected=直写保持加密；unsafe=走safeWrite保持明文；clear=清除手动标注"),
+  },
+  async ({ extension, category }) => {
+    try {
+      const p = getProfile();
+      const ext = extension.startsWith(".") ? extension.toLowerCase() : "." + extension.toLowerCase();
+      if (!Array.isArray(p.userProtectedExtensions)) p.userProtectedExtensions = [];
+      const removeFrom = (arr, v) => { const i = arr.indexOf(v); if (i !== -1) arr.splice(i, 1); };
+      if (category === "protected") {
+        if (p.userProtectedExtensions.indexOf(ext) === -1) p.userProtectedExtensions.push(ext);
+        // 保持加密的扩展名不应再走 safeWrite：从 encrypted/unsafe 自动列表移除
+        if (Array.isArray(p.encryptedExtensions)) removeFrom(p.encryptedExtensions, ext);
+        if (Array.isArray(p.unsafeExtensions)) removeFrom(p.unsafeExtensions, ext);
+        if (Array.isArray(p.safeExtensions)) removeFrom(p.safeExtensions, ext);
+        saveProfileCache(p);
+        return { content: [{ type: "text", text: "✅ 已标注 " + ext + " 为 protected（保持加密）：后续写入直接直写，由加密软件加密落盘；写入后检测对该扩展名自动跳过。" }] };
+      }
+      if (category === "unsafe") {
+        removeFrom(p.userProtectedExtensions, ext);
+        if (!Array.isArray(p.encryptedExtensions)) p.encryptedExtensions = [];
+        if (p.encryptedExtensions.indexOf(ext) === -1) p.encryptedExtensions.push(ext);
+        if (Array.isArray(p.safeExtensions)) removeFrom(p.safeExtensions, ext);
+        saveProfileCache(p);
+        return { content: [{ type: "text", text: "✅ 已标注 " + ext + " 为 unsafe（保持明文）：后续写入一律走 safeWrite 保持磁盘明文。" }] };
+      }
+      // clear：仅移除手动标注，自动分类列表保持现状
+      removeFrom(p.userProtectedExtensions, ext);
+      saveProfileCache(p);
+      return { content: [{ type: "text", text: "✅ 已清除 " + ext + " 的手动标注，恢复自动探测/写入后检测分类。" }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: "❌ 标注失败: " + e.message }], isError: true };
+    }
+  }
+);
+
+// 注册 encryption_profile 工具（查看环境探测结果）
+server.tool(
+  "encryption_profile",
+  "查看当前加密环境探测结果：safe/protected/unsafe 三类扩展名列表、可用外部进程、最佳写入组合（bestCombo）、机器指纹与缓存位置。结果缓存于 ~/.mcp-encryption-profile.json，换电脑自动重探。",
+  {},
+  { readOnlyHint: true },
+  async () => {
+    try {
+      const p = getProfile();
+      return { content: [{ type: "text", text: "加密环境探测结果（来自" + (loadProfileCache() ? "缓存" : "本次探测") + "）:\n" + formatProfileSummary(p) }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: "❌ 获取探测结果失败: " + e.message }], isError: true };
+    }
+  }
+);
+
+// 注册 refresh_profile 工具（强制重新探测并更新缓存）
+server.tool(
+  "refresh_profile",
+  "强制重新执行环境探测（扩展名分类 + 外部进程 + 交叉验证）并更新缓存。当加密软件策略变更、切换项目目录策略、或怀疑缓存过期时使用。探测过程在系统临时目录写入临时文件，不污染用户目录。",
+  {},
+  async () => {
+    try {
+      activeProfile = detectEnvironment();
+      saveProfileCache(activeProfile);
+      return { content: [{ type: "text", text: "✅ 已重新探测并更新缓存:\n" + formatProfileSummary(activeProfile) }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: "❌ 重新探测失败: " + e.message }], isError: true };
+    }
+  }
+);
+
 // 注册 read_file 工具
 server.tool(
   "read_file",
@@ -406,7 +1166,42 @@ server.tool(
       if (parent && !fs.existsSync(parent)) {
         fs.mkdirSync(parent, { recursive: true });
       }
+      // 环境自适应：unsafe/encrypted 扩展名直写会被透明加密，必须走 safeWrite
+      //（安全扩展名临时文件 + 外部进程复制）保证磁盘明文；未知扩展名先直写，
+      // 写入后用外部进程实测磁盘状态，发现密文自动重分类并立即纠正为明文
+      const decision = decideWriteStrategy(filePath);
+      if (decision.mode === "safe") {
+        let payload = finalContent;
+        if (writeMode === "append" && fs.existsSync(filePath)) {
+          // 追加模式：外部进程只做整文件复制，需先合并原内容再整体中转落盘
+          const prevFull = readFileContent(filePath);
+          if (!prevFull.ok) {
+            return { content: [{ type: "text", text: "❌ 追加失败：目标扩展名为 unsafe 且原文件无法读出明文（可能已处于不可解密状态）: " + filePath + "\n" + prevFull.error }], isError: true };
+          }
+          payload = (prevFull.hasBom ? "\uFEFF" : "") + prevFull.content + finalContent;
+        }
+        const r = safeWriteFile(filePath, payload);
+        if (r.ok) {
+          return { content: [{ type: "text", text: "✅ 写入成功" + (writeMode === "append" ? "（追加）" : "") + ": " + filePath + "\nℹ️ 目标扩展名为 " + decision.category + "（写入会加密），已走 safeWrite 明文落盘（" + r.via.process + " + " + r.via.extension + "）" }] };
+        }
+        // 全部组合失败：回退直写并明确告警（兜底行为，保证内容至少落盘）
+        fs.writeFileSync(filePath, payload, { encoding: "utf-8", flag: "w" });
+        return { content: [{ type: "text", text: "⚠️ 已写入但磁盘可能为不可解密密文：目标扩展名为 " + decision.category + " 且 safeWrite 全部组合失败（" + r.error + "），已回退直接写入: " + filePath }], isError: true };
+      }
       fs.writeFileSync(filePath, finalContent, { encoding: "utf-8", flag: writeMode === "append" ? "a" : "w" });
+      // 写入后实测：未知扩展名必测，已知 safe/protected 也复测（策略可能按目录生效或被调整）；
+      // 用户手动标注 protected 的扩展名跳过（用户意图优先）。发现密文自动重分类并纠正为明文
+      const wfProfile = getProfile();
+      if (wfProfile.postWriteDetectionEnabled && decision.category !== "user_protected") {
+        const ds = detectDiskStateAfterWrite(filePath, finalContent);
+        if (!ds.diskPlaintext) {
+          const sw = rescueToPlaintext(filePath, finalContent);
+          if (sw.ok) {
+            return { content: [{ type: "text", text: "✅ 写入成功" + (writeMode === "append" ? "（追加）" : "") + ": " + filePath + "\nℹ️ 首次探测到该扩展名写入后磁盘为密文，已自动重分类并转为 safeWrite 明文落盘（" + sw.via.process + " + " + sw.via.extension + "），后续该扩展名将直接走 safeWrite" }] };
+          }
+          return { content: [{ type: "text", text: "⚠️ 写入后磁盘为密文且自动纠正失败（" + sw.error + "），文件当前可能为密文: " + filePath }], isError: true };
+        }
+      }
       return { content: [{ type: "text", text: "✅ 写入成功" + (writeMode === "append" ? "（追加）" : "") + ": " + filePath }] };
     } catch (e) {
       return { content: [{ type: "text", text: "❌ 写入失败: " + e.message }], isError: true };
@@ -639,9 +1434,15 @@ server.tool(
         if (content === original) {
           return { content: [{ type: "text", text: "⚠️ 批量编辑应用后内容无变化，文件未修改: " + filePath }] };
         }
-        fs.writeFileSync(filePath, (hasBom ? "\uFEFF" : "") + content, "utf-8");
+        // 环境自适应：unsafe/encrypted 扩展名走 safeWrite 保持磁盘明文（失败回退直写并告警）；
+        // 未知扩展名直写后实测磁盘状态，发现密文自动重分类并纠正
+        const wb = writeBackWithStrategy(filePath, (hasBom ? "\uFEFF" : "") + content);
+        let wbNote = "";
+        if (wb.via && !wb.autoCorrected) wbNote = "\nℹ️ 目标扩展名写入会加密，已走 safeWrite 明文落盘（" + wb.via.process + " + " + wb.via.extension + "）";
+        if (wb.autoCorrected) wbNote = "\nℹ️ 写入后实测磁盘为密文，已自动重分类该扩展名并用 safeWrite 重写为明文（" + wb.via.process + " + " + wb.via.extension + "）";
+        if (wb.degraded) wbNote = "\n⚠️ 目标扩展名写入会加密且 safeWrite 失败（" + wb.error + "），已回退直接写入，磁盘可能为不可解密密文";
         return {
-          content: [{ type: "text", text: "✅ 批量编辑成功: " + filePath + "\n共 " + edits.length + " 条，" + total + " 处替换\n" + applied.join("\n") }],
+          content: [{ type: "text", text: "✅ 批量编辑成功: " + filePath + "\n共 " + edits.length + " 条，" + total + " 处替换\n" + applied.join("\n") + wbNote }],
         };
       }
 
@@ -667,7 +1468,12 @@ server.tool(
         return { content: [{ type: "text", text: "⚠️ 替换后内容无变化，文件未修改: " + filePath }] };
       }
       // 原文件带 BOM 时补回，保持文件编码特征不变（部分 Windows 软件依赖 BOM）
-      fs.writeFileSync(filePath, (hasBom ? "\uFEFF" : "") + updated, "utf-8");
+      // 环境自适应：unsafe/encrypted 扩展名走 safeWrite 保持磁盘明文（失败回退直写并告警）；
+      // 未知扩展名直写后实测磁盘状态，发现密文自动重分类并纠正
+      const wbSingle = writeBackWithStrategy(filePath, (hasBom ? "\uFEFF" : "") + updated);
+      if (wbSingle.via && !wbSingle.autoCorrected) warning += "\nℹ️ 目标扩展名写入会加密，已走 safeWrite 明文落盘（" + wbSingle.via.process + " + " + wbSingle.via.extension + "）";
+      if (wbSingle.autoCorrected) warning += "\nℹ️ 写入后实测磁盘为密文，已自动重分类该扩展名并用 safeWrite 重写为明文（" + wbSingle.via.process + " + " + wbSingle.via.extension + "）";
+      if (wbSingle.degraded) warning += "\n⚠️ 目标扩展名写入会加密且 safeWrite 失败（" + wbSingle.error + "），已回退直接写入，磁盘可能为不可解密密文";
       return {
         content: [{ type: "text", text: "✅ 替换成功: " + filePath + "\n替换 " + (replaceAll ? count : 1) + "/" + count + " 处" + warning }],
       };
@@ -909,6 +1715,13 @@ server.tool(
   { readOnlyHint: true },
   async ({ path: filePath }) => {
     let base = "✅ read-file-server 运行中\n平台: Node.js " + process.version + "\n版本: " + pkg.version + "\n功能: 通过 Node.js fs 读写文件明文（加密软件白名单中的 Node.js 进程自动解密/加密）";
+    // 环境自适应 profile 概要（懒加载，首次调用触发探测或读缓存）
+    try {
+      const prof = getProfile();
+      base += "\n环境探测: safe=" + prof.safeExtensions.length + " 个, protected=" + prof.protectedExtensions.length + " 个, unsafe=" + prof.unsafeExtensions.length + " 个, encrypted=" + (prof.encryptedExtensions || []).length + " 个, 用户标注=" + (prof.userProtectedExtensions || []).length + " 个 | 可用进程: " + (prof.availableProcesses.map((x) => x.id).join(",") || "无") + " | bestCombo: " + (prof.bestCombo ? prof.bestCombo.process + "+" + prof.bestCombo.extension : "无") + "\n详情可用 encryption_profile 工具查看";
+    } catch (e) {
+      base += "\n环境探测: 失败（" + e.message + "），写工具按原始直写行为运行";
+    }
     if (filePath === undefined) {
       base += "\n提示: 传入 path 参数可实测解密能力（本次未做实测）";
       return { content: [{ type: "text", text: base }] };
@@ -1087,7 +1900,33 @@ server.tool(
       if (srcStat.isDirectory() && destStat && destStat.isFile()) {
         return { content: [{ type: "text", text: "❌ 无法复制：源是目录但目标是已存在的文件: " + finalDest }], isError: true };
       }
+      // 环境自适应：文件目标扩展名为 unsafe/encrypted 时，cpSync 直写会产生密文，
+      // 改走 safeCopy（安全扩展名中转 + 外部进程落盘）；目录暂不逐个处理，维持原行为。
+      // 未知扩展名直写后实测磁盘状态（仅对有内容的源文件），发现密文自动重分类并纠正
+      const copyDecision = srcStat.isFile() ? decideWriteStrategy(finalDest) : null;
+      if (srcStat.isFile() && copyDecision.mode === "safe") {
+        const sc = safeCopyFileTo(source, finalDest);
+        if (sc.ok) {
+          return { content: [{ type: "text", text: "✅ 复制成功: " + source + " -> " + finalDest + "\nℹ️ 目标扩展名为 " + copyDecision.category + "（写入会加密），已走 safeCopy 明文落盘（" + sc.via.process + " + " + sc.via.extension + "）" }] };
+        }
+        // 全部组合失败：回退 cpSync 直写并告警
+        fs.cpSync(source, finalDest, { force: true });
+        return { content: [{ type: "text", text: "⚠️ 已复制但磁盘可能为不可解密密文：目标扩展名为 " + copyDecision.category + " 且 safeCopy 全部组合失败（" + sc.error + "），已回退直接复制: " + finalDest }], isError: true };
+      }
       fs.cpSync(source, finalDest, { recursive: srcStat.isDirectory(), force: true });
+      if (srcStat.isFile() && copyDecision && copyDecision.category !== "user_protected" && srcStat.size > 0) {
+        const cpProfile = getProfile();
+        if (cpProfile.postWriteDetectionEnabled) {
+          const ds = detectDiskStateAfterWrite(finalDest, fs.readFileSync(finalDest, "utf-8"));
+          if (!ds.diskPlaintext) {
+            const sc2 = safeCopyFileTo(source, finalDest);
+            if (sc2.ok) {
+              return { content: [{ type: "text", text: "✅ 复制成功: " + source + " -> " + finalDest + "\nℹ️ 复制后实测磁盘为密文，已自动重分类该扩展名并用 safeCopy 重写为明文（" + sc2.via.process + " + " + sc2.via.extension + "）" }] };
+            }
+            return { content: [{ type: "text", text: "⚠️ 复制后磁盘为密文且自动纠正失败（" + sc2.error + "），目标文件可能为密文: " + finalDest }], isError: true };
+          }
+        }
+      }
       return { content: [{ type: "text", text: "✅ 复制成功: " + source + " -> " + finalDest + (srcStat.isDirectory() ? "（递归目录）" : "") }] };
     } catch (e) {
       return { content: [{ type: "text", text: "❌ 复制失败: " + e.message }], isError: true };
@@ -1123,18 +1962,50 @@ server.tool(
       } catch (e) {
         if (e.code !== "ENOENT") throw e;
       }
+      // 环境自适应：文件目标扩展名为 unsafe/encrypted 时，rename 会把源文件的磁盘状态
+      // 原样带到加密扩展名上（密文改名后无法解密），改走 safeCopy 明文落盘后删源。
+      // 未知扩展名 rename 后实测磁盘状态（仅非空文件），发现密文自动重分类并纠正
+      const moveDecision = srcStat.isFile() ? decideWriteStrategy(finalDest) : null;
+      if (srcStat.isFile() && moveDecision.mode === "safe") {
+        const sm = safeCopyFileTo(source, finalDest);
+        if (sm.ok) {
+          fs.rmSync(source, { force: true });
+          return { content: [{ type: "text", text: "✅ 移动成功: " + source + " -> " + finalDest + "\nℹ️ 目标扩展名为 " + moveDecision.category + "（写入会加密），已走 safeCopy 明文落盘（" + sm.via.process + " + " + sm.via.extension + "）并删除源" }] };
+        }
+        // safeCopy 失败则继续走下方 rename 原逻辑（保持兜底行为）
+      }
+      let moved = false;
+      let moveNote = "";
       try {
         fs.renameSync(source, finalDest);
-        return { content: [{ type: "text", text: "✅ 移动成功: " + source + " -> " + finalDest }] };
+        moved = true;
       } catch (e) {
         if (e.code === "EXDEV") {
           // 跨盘符：rename 不可用，回退为 cp + rm
           fs.cpSync(source, finalDest, { recursive: srcStat.isDirectory(), force: true });
           fs.rmSync(source, { recursive: srcStat.isDirectory(), force: true });
-          return { content: [{ type: "text", text: "✅ 移动成功（跨盘符，复制后删除源）: " + source + " -> " + finalDest }] };
+          moved = true;
+          moveNote = "（跨盘符，复制后删除源）";
+        } else {
+          throw e;
         }
-        throw e;
       }
+      // rename 是否触发透明加密因加密软件实现而异：实测目标磁盘状态，
+      // 密文则用 safeCopy 纠正（此时源已不存在，从目标读回明文经临时文件中转重写）
+      if (srcStat.isFile() && moveDecision && moveDecision.category !== "user_protected" && srcStat.size > 0) {
+        const mvProfile = getProfile();
+        if (mvProfile.postWriteDetectionEnabled) {
+          const ds = detectDiskStateAfterWrite(finalDest, fs.readFileSync(finalDest, "utf-8"));
+          if (!ds.diskPlaintext) {
+            const sm2 = safeCopyFileTo(finalDest, finalDest);
+            if (sm2.ok) {
+              return { content: [{ type: "text", text: "✅ 移动成功" + moveNote + ": " + source + " -> " + finalDest + "\nℹ️ 移动后实测磁盘为密文，已自动重分类该扩展名并用 safeCopy 重写为明文（" + sm2.via.process + " + " + sm2.via.extension + "）" }] };
+            }
+            return { content: [{ type: "text", text: "⚠️ 移动后磁盘为密文且自动纠正失败（" + sm2.error + "），目标文件可能为密文: " + finalDest }], isError: true };
+          }
+        }
+      }
+      return { content: [{ type: "text", text: "✅ 移动成功" + moveNote + ": " + source + " -> " + finalDest }] };
     } catch (e) {
       if (e.code === "ENOENT") {
         return { content: [{ type: "text", text: "❌ 源路径不存在: " + source }], isError: true };
