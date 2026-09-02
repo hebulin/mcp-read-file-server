@@ -349,3 +349,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
    npx -y mcp-read-file-server   # 能启动=包没问题，问题在 Agent 配置/环境
    ```
    能启动并卡住等输入，说明包正常，需检查 Agent 的配置 JSON 格式与 `command` 写法。
+
+
+---
+[![MCP Badge](https://lobehub.com/badge/mcp/hebulin-mcp-read-file-server)](https://lobehub.com/mcp/hebulin-mcp-read-file-server)
