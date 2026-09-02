@@ -89,11 +89,11 @@ AI Agent  --(MCP/stdio)-->  Node.js MCP Server  --(fs.readFileSync)-->  读取�
 
 当自动分类不符合预期时手动干预（标注优先级高于一切自动分类）：
 
-| 场景 | 调用 | 效果 |
-|------|------|------|
-| `.java` 需要保持 TSD 加密（公司受控文档） | `mark_extension(".java", "protected")` | 直写保持加密，Notepad 打开正常，跳过写入后自动纠正 |
+| 场景                                         | 调用 | 效果 |
+|----------------------------------------------|------|------|
+| `.java` 需要保持 TSD 加密（company受控文档） | `mark_extension(".java", "protected")` | 直写保持加密，Notepad 打开正常，跳过写入后自动纠正 |
 | `.scss` 必须保持明文（自动误判为 protected） | `mark_extension(".scss", "unsafe")` | 强制走 safeWrite 保持明文 |
-| 恢复自动分类 | `mark_extension(".java", "clear")` | 清除手动标注 |
+| 恢复自动分类                                 | `mark_extension(".java", "clear")` | 清除手动标注 |
 
 ## 文件结构
 
@@ -332,15 +332,20 @@ find_files 之外的文件名查找也优先用 MCP 工具。
 
 ## 使用规则
 1. 会话开始先调 check_status 确认白名单解密正常；环境不明时调
-   encryption_profile 查看本机扩展名分类（safe/protected/unsafe）与可用进程。
+   encryption_profile 查看本机扩展名分类（safe/protected/unsafe/encrypted）与可用进程。
 2. 写任何扩展名的文件都不用关心加密细节：write_file/edit_file/copy_path/
-   move_path 已内置环境自适应，unsafe 扩展名会自动走 safeWrite 保证磁盘明文。
-3. edit_file 前必须先 read_file 拿原文，oldString 从原文原样复制
+   move_path 已内置环境自适应与写入后实时检测——写入后磁盘为密文的扩展名
+   会被自动识别并立即重写为明文，后续同类文件自动走 safeWrite。
+3. 需要保持加密状态的扩展名（如受控的 .java 文档）：用
+   mark_extension(".java", "protected") 标注一次即可，之后写入直写保持加密；
+   反之若某扩展名被误判导致写入后变密文，用 mark_extension(".ext", "unsafe")
+   强制保持明文。标注一次永久生效（缓存在本机）。
+4. edit_file 前必须先 read_file 拿原文，oldString 从原文原样复制
    （含空格与缩进；CRLF/LF 换行差异会自动兼容，无需手工处理）。
-4. 路径一律使用绝对路径。
-5. 若写工具返回「safeWrite 失败/回退直接写入」告警，先调 refresh_profile
+5. 路径一律使用绝对路径。
+6. 若写工具返回「safeWrite 失败/回退直接写入」告警，先调 refresh_profile
    重新探测环境，再重试写入；仍失败则把告警原文报告给用户。
-6. edit_file 匹配失败时，按返回的「可能相关的行」诊断修正 oldString，
+7. edit_file 匹配失败时，按返回的「可能相关的行」诊断修正 oldString，
    不要盲目重试。
 ```
 
