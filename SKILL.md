@@ -1,200 +1,44 @@
 ---
 name: encryption-file-ops
-description: 在文件加密软件（天锐绿盾 / IP-Guard / 亿赛通 / 深信服等）环境下，使用 mcp__read-file-server__* 工具替代 AI Agent 内置 Read/Write/Edit/Grep 工具读写明文。当内置工具返回密文/乱码，或用户提到"加密、绿盾、密文、白名单、读不到文件"等关键词时激活。
+description: 在Node.js为加密软件白名单进程的环境中，使用文件操作MCP安全读取、编辑与校验文件；根据结构化结果处理明文、受控写入与失败恢复。
 ---
 
-# 加密环境文件操作 Skill
+# 加密环境文件操作
 
-> **本 Skill 负责"教策略"，MCP Server 负责"执行"。**
-> 本 Skill 不替代任何 MCP 工具，仅提供使用指引。
+使用前确认Node.js受信任，并配置read-file-server。版本1.9.0提供18个工具，最低Node20。
 
-## 一、适用场景
+## 工具选择
 
-### 触发条件（满足任一即激活）
-- 内置 `Read/Write/Edit/Grep` 工具返回密文、十六进制乱码、`%TSD-Header-###%` 文件头
-- 用户提到关键词：天锐、绿盾、TSD、IP-Guard、亿赛通、深信服、加密软件、白名单、密文、解密失败
-- 项目文件头出现 `%TSD-Header-###%` 等加密标识
+- 读取：read_file、read_files；大文件使用read_file_partial和nextOffset/nextLine。
+- 编辑：edit_file，多个修改用edits数组；先dryRun预览，需要时指定expectedHash和expectedMatches。
+- 写入/追加：write_file；不要自行绕过错误改用普通shell覆盖。
+- 搜索：search_files，普通文本优先mode=literal；include优先传数组。隐藏项用showHidden，构建目录用useDefaultIgnore=false。
+- 文件名/目录：find_files、list_directory；信息与指纹：file_info。
+- 复制/移动/删除：copy_path、move_path、remove_path；删除可先dryRun。
+- 策略：inspect_write_strategy、encryption_profile、mark_extension、refresh_profile。
 
-### 前置条件
-- Node.js 进程已被加密软件列为**白名单（受信任进程）**
-- `mcp-read-file-server` MCP Server 已配置（见项目 `README.md`）
-- 在 `claude mcp list` 中能看到 `read-file-server`
+## 必须理解的结果
 
----
+1. 优先读取structuredContent的ok、code、changed、data和warnings，不能只看人类文本。
+2. isError=true时可能存在目录操作部分目标；查看partial/sourceRetained。单文件回滚失败时查看recoveryPath并保留备份。
+3. contentVerified表示Node可见内容一致；diskVerified才表示独立读取器的完整磁盘指纹一致。unknown不能声称已落盘明文。
+4. check_status基础调用不探测环境。文件可读取也不能直接推断解密正常，可信expectedHash匹配才提供明确内容对照。
+5. 文本工具只支持有效UTF8；UTF16、GBK、非法字节或NUL被拒绝时，必须先明确转换编码，不能强制按UTF8写回。
 
-## 二、工具映射表
+## 写入策略
 
-| 场景 | 内置工具（禁用） | MCP 工具（用这个） |
-|------|------------------|---------------------|
-| 读单个文件 | `Read` | `mcp__read-file-server__read_file` |
-| 读 ≥2 个文件 | 多次 `Read` | `mcp__read-file-server__read_files` |
-| 局部读文件（前N字符/指定行） | `Read`（局部） | `mcp__read-file-server__read_file_partial` |
-| 写文件 | `Write` | `mcp__read-file-server__write_file` |
-| 精确编辑 | `Edit` / `MultiEdit` | `mcp__read-file-server__edit_file` |
-| 搜索内容 | `Grep` | `mcp__read-file-server__search_files` |
-| 按文件名查找 | `Glob` | `mcp__read-file-server__find_files` |
-| 列目录内容 | `LS` | `mcp__read-file-server__list_directory` |
-| 复制文件/目录 | `Bash cp` | `mcp__read-file-server__copy_path` |
-| 移动/重命名 | `Bash mv` | `mcp__read-file-server__move_path` |
-| 删除文件/目录 | `Bash rm` | `mcp__read-file-server__remove_path` |
-| 创建目录 | （无） | `mcp__read-file-server__create_directory` |
-| 查文件信息 | （无） | `mcp__read-file-server__file_info` |
-| 健康检查 | （无） | `mcp__read-file-server__check_status` |
-| 查看环境探测结果 | （无） | `mcp__read-file-server__encryption_profile` |
-| 重新探测环境（策略变更后） | （无） | `mcp__read-file-server__refresh_profile` |
-| 手动标注扩展名保持加密/明文 | （无） | `mcp__read-file-server__mark_extension` |
+- mark_extension(category=protected)永久记录保持受控写入，等价于默认使用preserve；unsafe要求验证磁盘明文；clear可清除两者。
+- refresh_profile只更新自动观察，不删除手工策略。
+- writePolicy=auto按目标目录探测；protected保持受控写入，unsafe安全中转。显式plaintext必须验证成功，失败保留原文件。
+- 旧v2人工unsafe和自动encrypted记录无法区分；升级后需要永久强制明文的后缀应重新标注unsafe。protected会迁移。
+- 使用绝对路径；相对路径以MCP_BASE_DIR或服务启动目录为基准。
 
-> **强约束**：在加密环境下，**禁止使用** `Read/Write/Edit/MultiEdit/Grep/Glob/LS` 内置工具与 `Bash` 的 `cp/mv/rm` 文件操作--它们会读到密文、写出密文或破坏加密结构。
+## 编辑约定
 
----
+edits与oldString/newString/useRegex等单次字段互斥；批量ignoreCase可用。默认只改第一处，expectedMatches可要求唯一匹配。CRLF/LF/CR差异会适配，新文本跟随原行尾，未匹配区域保持不变；BOM自动保留。正则超过预算返回REGEX_TIMEOUT，改为更具体的模式或字面量，不重复发起同一灾难性正则。
 
-## 三、决策树
+## 预算与恢复
 
-```
-需要读文件
-  ├─ 单个（全文）-> mcp__read-file-server__read_file
-  ├─ 多个（≥2）-> mcp__read-file-server__read_files（批量更高效）
-  └─ 局部读取（大文件预览/定位特定行）-> mcp__read-file-server__read_file_partial
-      ├─ 读前N字符 -> mode="chars", charCount=N
-      └─ 读指定行范围 -> mode="lines", startLine=X, endLine=Y（endLine 不传则只读一行）
+单页40万字符、完整文本修改16MB、搜索单文件5MB。字符offset使用UTF16单元，必须沿用nextOffset以免切开代理对。行分页不保证提前给出总行数。复制/移动目录逐文件验证，但不是跨文件事务；出现失败时根据partial处理。复制/移动遇到符号链接会明确拒绝，不自动跟随。
 
-需要修改文件
-  ├─ 已读过 -> 直接 mcp__read-file-server__edit_file
-  └─ 未读过 -> 先 read_file 拿到明文 -> 再 edit_file
-
-需要新建/覆盖文件
-  └─ mcp__read-file-server__write_file
-
-需要搜索内容
-  └─ mcp__read-file-server__search_files
-      ├─ 限定文件类型 -> 用 include（如 "*.java,*.xml"）
-      └─ 控制返回数量 -> 用 maxResults
-
-需要创建目录
-  └─ mcp__read-file-server__create_directory
-
-需要判断文件是否存在 / 查大小
-  └─ mcp__read-file-server__file_info
-
-工具异常 / 不确定是否生效
-  └─ mcp__read-file-server__check_status
-```
-
----
-
-## 四、典型工作流
-
-### 流程 1：读取并修改文件
-```
-1. mcp__read-file-server__read_file 读取明文
-2. 分析内容
-3. 修改：
-   - 单处修改 -> mcp__read-file-server__edit_file（oldString/newString）
-   - 多处修改 -> mcp__read-file-server__edit_file 的 edits 数组（原子：失败整体不写盘）
-   - oldString 从第 1 步读到的内容里**原样复制**（含空格、缩进；换行风格差异会自动兼容）
-4. 必要时再 read_file 验证修改结果
-```
-
-### 流程 2：批量读多个相关文件
-```
-1. mcp__read-file-server__read_files
-   - paths 参数用英文逗号分隔，如 "D:/proj/A.java,D:/proj/B.java"
-2. 统一分析（输出会带"========== 文件: xxx =========="分隔）
-```
-
-### 流程 3：在项目中搜索特定代码
-```
-1. mcp__read-file-server__search_files
-   - pattern: 正则表达式（如 "function\s+\w+"、"@GetMapping"）
-   - path: 搜索根目录
-   - include: 文件名过滤（可选）
-2. 根据返回的 file:line 定位，用 read_file 读取具体文件
-```
-
-### 流程 4：从零创建新模块
-```
-1. mcp__read-file-server__create_directory 建包目录
-2. mcp__read-file-server__write_file 逐个创建文件
-3. read_file 验证（可选）
-```
-
----
-
-## 五、`edit_file` 关键参数详解
-
-| 参数 | 类型 | 必填 | 默认 | 说明 |
-|------|------|------|------|------|
-| `path` | string | ✅ | - | 文件绝对路径 |
-| `oldString` | string | 单次模式✅ | - | 要替换的原内容，必须**精确匹配**（换行风格差异已自动兼容） |
-| `newString` | string | 单次模式✅ | - | 替换后的新内容 |
-| `edits` | array | 批量模式✅ | - | 批量原子编辑：`[{oldString, newString, replaceAll?}]` 按序应用，**任一条目失败则整体不写盘**（不会产生半改状态）。一次完成多处修改必须用它，不要逐条调用 |
-| `useRegex` | boolean | ❌ | false | true 时 oldString 当正则（单次模式），可用 `$1 $2` 引用捕获组；默认启用多行模式（`^`/`$` 按行锚定） |
-| `replaceAll` | boolean | ❌ | false | true 时替换所有匹配项；false 时仅替换第一处 |
-| `ignoreCase` | boolean | ❌ | false | 是否忽略大小写（仅字符串模式生效） |
-
-### 常见用法
-- **单点替换**：`useRegex=false, replaceAll=false`（默认）
-- **批量替换**：`useRegex=true, replaceAll=true`（如改命名）
-- **多处修改**：`edits` 数组（如重命名+改值+删行一次完成，失败自动整体回滚）
-- **正则提取后重组**：`useRegex=true, newString` 里用 `$1` `$2`
-
-### 实战避坑（来自真实使用反馈）
-
-1. **换行差异已自动兼容，无需关心 CRLF/LF**：oldString 用 LF 匹配 CRLF 文件（或相反）均可命中，newString 行尾自动跟随文件风格。**不要**再为此绕道写 Node 补丁脚本手工归一
-2. **oldString 含反引号 `` ` `` 与 `${}` 直接原样传入**：MCP 参数走 JSON 传输，无 JS 模板字面量的转义层级问题；同样不要绕道脚本（脚本里转义极易写错）
-3. **多处修改必须用 `edits` 批量模式**：逐条调用时若中途失败，前面条目已写盘会产生「半改状态」，后续按原内容构造的 oldString 必然失配；`edits` 原子模式要么全成要么不动。**批量条目按序应用**：前面条目的 newString 会成为后续条目的匹配环境，请按文件现状顺序构造（如 A 改为 B 后，后条可用 B 做锚点）
-4. **oldString 带足上下文保证唯一**：短 oldString 命中多处时工具会警告（如 `替换 1/2 处`），此时加长上下文（含前后行）唯一定位；超长行（如记忆表格行）优先选行内独有片段做锚点
-5. **匹配失败看诊断**：失败信息会附「可能相关的行」及相似度，直接对照检查空白/缩进/字符差异，不要盲目重试；正则模式报错时注意 oldString 正则里 `$` 需写成 `\$`（如匹配字面 `$1`），而 newString 里的 `$1` 是捕获组引用原样保留
-
----
-
-## 六、注意事项
-
-1. **环境自适应（v1.7.0+）**：写工具（write_file/edit_file/copy_path/move_path）已内置扩展名分类感知，unsafe 扩展名（直写会变不可解密密文的类型，如部分机器的 .scss/.css）自动走 safeWrite 明文落盘，**无需任何特殊处理**；策略变更或换电脑后探测缓存自动失效重探，也可手动调 `refresh_profile`
-2. **写入后实时重分类（v1.8.0+）**：直写完成后会用外部进程实测磁盘字节，发现密文自动重分类该扩展名并立即重写为明文（返回中会有「已自动重分类」提示）；已知 safe/protected 扩展名也会复测，目录级策略差异可自动纠正。需要**保持加密**的扩展名（如公司受控的 .java），用 `mark_extension(".java", "protected")` 标注后直写保持加密并跳过自动纠正
-3. **路径**：用**绝对路径**最稳（如 `D:/AiJiamiToolsPlugins/...`），相对路径以 MCP Server 启动目录为基准
-4. **`edit_file` 前必读**：必须先 `read_file` 拿到明文，再从原文里**原样复制** `oldString`，否则会因为空格/缩进不匹配而失败
-5. **换行风格无需担心**：文件是 CRLF 而 `oldString` 是 LF（或相反）时，`edit_file` 会自动归一换行后匹配；`newString` 行尾也会自动跟随文件主导风格，不会产生混行
-6. **`write_file` 是覆盖写**：会清空原文件再写入，重要文件修改前建议先 `read_file` 备份内容
-7. **`search_files` / `find_files` 自动跳过**：`node_modules`、`.git`、`target`、`build`、`dist`、`.svn`、`bin`、`obj`、`out`、`vendor` 与 `.` 开头的隐藏文件/目录；`search_files` 另跳过二进制与超过 5MB 的文件
-8. **大批量搜索**：用 `maxResults` 控制返回数量，避免一次性返回过多结果
-9. **工具调用顺序**：复杂任务先 `check_status`（可传 path 实测解密）确认 MCP 正常，再正式操作
-10. **`remove_path` 不可恢复**：递归删除前建议先 `list_directory` 确认内容
-11. **`read_files` 路径含逗号时必须传数组**：Windows 路径可合法包含英文逗号，逗号分隔字符串形式会被错误切分
-
----
-
-## 七、故障排查
-
-| 现象 | 可能原因 | 解决方案 |
-|------|----------|----------|
-| 写入 .scss/.css 后文件显示乱码（密文） | 该扩展名为 unsafe 且 safeWrite 未生效（缓存过期/策略变更） | 调 `refresh_profile` 重探后重写；用 `encryption_profile` 确认分类与可用进程；1.8.0+ 写入后会自动实测纠正，若仍乱码用 `mark_extension(".scss", "unsafe")` 强制明文 |
-| 写入 .java 后被自动转明文（需要保持加密） | 1.8.0+ 写入后检测发现密文自动纠正为明文 | 用 `mark_extension(".java", "protected")` 标注保持加密，后续直写不再自动纠正 |
-| 写工具提示「safeWrite 失败，已回退直接写入」 | 无可用外部进程或全部组合验证失败 | 调 `refresh_profile`；确认 MCP Server 进程可 spawn powershell/cmd；删除乱码文件后重写 |
-| 读到的还是密文/乱码 | Node.js 不在加密软件白名单 | 联系管理员把 `node.exe` 加入白名单 |
-| `mcp__read-file-server__*` 工具全部不可见 | MCP Server 未配置或未启动 | 见 `README.md` 配置 `.mcp.json` |
-| `edit_file` 报"未找到匹配内容" | `oldString` 拼写、缩进不对（换行 CRLF/LF 差异与 BOM 已自动兼容） | 重新 `read_file` 复制原文，**不要凭记忆写**；重点检查空格与缩进 |
-| 读取被拒：文件疑似 UTF-16 | 工具仅支持 UTF-8 | 先转换为 UTF-8 再操作（防乱码与写回损坏） |
-| `edit_file` 拒绝编辑：疑似非 UTF-8（GBK 等） | 按 UTF-8 读出大量乱码替换字符 | 继续写回会不可逆损坏文件；先转码再编辑 |
-| 大文件读取不完整 | 超过 40 万字符自动截断 | 用 `read_file_partial` 分页读取 |
-| `search_files` 搜不到某些文件 | 二进制/超大(>5MB)文件被跳过，或隐藏文件/忽略目录被排除 | 看返回尾部的跳过统计；必要时用 `include` 限定范围 |
-| `edit_file` 报"匹配到 N 处" | 文件中存在重复内容 | 加更长/更唯一的 `oldString` 唯一定位，或 `replaceAll=true` |
-| `search_files` 报"正则表达式无效" | 正则语法错误 | 检查 `pattern` 是否需要转义特殊字符 |
-| `write_file` 报权限错误 | 文件被占用或目录无写权限 | 关闭占用进程 / 检查目录权限 |
-| 工具调用超时 | 文件过大 | 改用 `search_files` 定位后只 `read_file` 关键段，或用 `read_file_partial` 局部读取 |
-
----
-
-## 八、与其他工具的关系
-
-| 工具类型 | 在加密环境下 | 备注 |
-|----------|--------------|------|
-| 内置 `Read/Write/Edit/Grep/Glob/LS` | ❌ 禁用 | 会读到密文或破坏加密 |
-| 内置 `Bash` | ⚠️ 慎用 | Bash 进程通常不在白名单，`cat`/`sed`/`cp`/`mv`/`rm` 也会读到密文或产出密文文件；文件操作一律改用 MCP 工具 |
-| 内置 `Glob` | ✅ 可用 | 只列文件名，不读内容 |
-| 内置 `NotebookEdit` | ⚠️ 慎用 | 同 Edit |
-| `mcp__read-file-server__*` | ✅ 主用 | 本 Skill 推广的工具集 |
-| `TaskCreate` / `TaskList` | ✅ 可用 | 任务管理，不涉及文件内容 |
-| `WebFetch` / `WebSearch` | ✅ 可用 | 网络工具，与本地加密无关 |
-
-> **Bash 特别注意**：在加密环境下，`Bash` 工具的 `cat`/`sed`/`grep` 也会读到密文。如需在终端操作文件，应使用 `node -e` 走 Node.js 白名单进程。
+不要删除.mcp-backup-*、recoveryPath或正在运行进程的锁。进程异常退出后，先比对目标与备份，再恢复；不能承诺任意断电后自动恢复。测试必须使用独立MCP_PROFILE_DIR和MCP_TEST_ROOT，避免覆盖真实人工策略。开发验收执行npm run check、npm test、npm audit，真实TSD环境另用专门样本验证。

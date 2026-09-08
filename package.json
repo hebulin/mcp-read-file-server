@@ -1,6 +1,6 @@
 {
   "name": "mcp-read-file-server",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "description": "加密环境文件操作 MCP 工具。当 Node.js 是加密软件白名单进程时，通过 fs 模块自动解密读写文件明文，替代 AI Agent 内置文件工具，适用于任何支持 MCP 协议的 Agent。",
   "type": "commonjs",
   "main": "index.js",
@@ -9,13 +9,15 @@
   },
   "files": [
     "index.js",
+    "lib/",
     "README.md",
     "SKILL.md",
     "LICENSE"
   ],
   "scripts": {
     "start": "node index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test --test-reporter=tap --test-concurrency=1 test/regression.test.js test/protocol.test.js test/adapters.test.js",
+    "check": "node scripts/check.js"
   },
   "keywords": [
     "mcp",
@@ -39,13 +41,17 @@
     "url": "https://github.com/hebulin/mcp-read-file-server/issues"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "publishConfig": {
     "access": "public"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "zod": "^4.4.3"
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "4.4.3"
+  },
+  "overrides": {
+    "fast-uri": "^3.1.6",
+    "qs": "^6.16.0"
   }
 }
