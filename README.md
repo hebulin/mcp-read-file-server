@@ -4,9 +4,9 @@
 
 加密环境文件操作工具。当 Node.js 是加密软件白名单进程时，通过 fs 模块自动解密读写文件明文，替代 AI Agent 内置文件工具，解决加密环境下读到密文的问题。适用于任何支持 MCP 协议的 AI Agent。
 
-**v1.7.0 环境自适应**：自动探测本机加密策略（哪些扩展名会被透明加密、哪些进程可用），对「会被加密且无法解密」的扩展名（如部分机器上的 `.scss`/`.css`）自动走 safeWrite 中转落盘明文，无需任何手工配置，换电脑自动重新探测。详见下文「环境自适应」。
+**v1.7.0 环境自适应**：自动探测本机加密策略（哪些扩展名会被透明加密、哪些进程可用），对「会被加密且无法解密」的扩展名自动走 safeWrite 中转落盘明文，无需任何手工配置，换电脑自动重新探测。详见下文「环境自适应」。
 
-**v1.8.0 写入后实时重分类**：启动探测只给出先验分类，且 Node.js 白名单读回无法区分「真受控（TSD 管控文档）」与「伪受控」。1.8.0 起所有直写路径完成后，用外部进程读取目标文件磁盘原始字节实测：发现密文（命中 `%TSD` 魔数）自动将该扩展名重分类为 encrypted 并立即用 safeWrite 重写为明文；实测明文则重分类为 safe。对需要**保持加密**的扩展名（如 `.java`），用 `mark_extension` 手动标注 protected 后，写入直写保持加密且跳过自动纠正。
+**v1.9.0 可回滚写入与目录级策略**：全部文本修改改为「完整载荷 → 独占暂存 → 独立指纹校验 → 原文件备份 → 提交 → 最终校验」事务流程，失败自动回滚，回滚失败保留 `recoveryPath`；加密策略按「目标目录 × 扩展名」实时探测，人工标注（`mark_extension`）独立持久化到 `.mcp-file-policies/`，刷新探测/重启/TTL 过期均不丢失；safeWrite 失败不再回退直写（保护原文）；复制/移动目录逐文件执行相同策略；所有工具返回统一 `structuredContent`（ok/code/changed/data/warnings）。
 
 ## 适用场景
 
@@ -32,8 +32,16 @@
 ## 架构
 
 ```
-AI Agent  --(MCP/stdio)-->  Node.js MCP Server  --(fs.readFileSync)-->  读取明文
+AI Agent  --(MCP/stdio)-->  Node.js MCP Server(index.js)  --(lib/ 模块)-->  fs 读写明文
 ```
+
+- `index.js` 仅负责 stdio 启动与正则 worker 回收
+- `lib/encryption.js` 目录级加密探测、写入策略决策、safeWrite 组合与独立指纹校验
+- `lib/files.js` 路径边界、跨实例锁、可回滚提交（暂存→备份→rename→终验）、目录逐文件复制/移动
+- `lib/text.js` 严格 UTF-8 增量解码与流式分页
+- `lib/patterns.js` 无回溯 glob 与保留原索引的字符串替换
+- `lib/regex.js` / `lib/regex-worker.js` 用户正则在可终止 worker 中执行（默认 1 秒预算）
+- `lib/server.js` 注册全部 18 个 MCP 工具，统一 structuredContent 与超时/只读包装
 
 ## 环境自适应（v1.7.0+）
 
@@ -52,48 +60,63 @@ AI Agent  --(MCP/stdio)-->  Node.js MCP Server  --(fs.readFileSync)-->  读取�
 对 unsafe 扩展名目标，写入流程自动切换为：
 
 ```
-1. fs.writeFileSync 写入 目标路径+安全扩展名 的临时文件（安全类型 → 磁盘明文）
-2. 用探测到的可用外部进程（powershell/cmd/robocopy/cscript 等）复制临时文件到目标路径
+1. 写入 目标目录下 .mcp-safe-<uuid><安全扩展名> 的随机临时文件（安全类型 → 磁盘明文）
+2. 用探测到的可用外部进程（powershell/pwsh/cmd/robocopy/cscript）复制临时文件到目标路径
    （外部进程不在白名单内，复制动作不触发透明加密 → 目标落盘为明文）
-3. 校验目标文件磁盘字节为明文
+3. 用独立读取器（PowerShell 流式 SHA256+size）校验目标文件磁盘指纹为明文
 4. 清理临时文件
-5. 失败则遍历全部「安全扩展名 × 可用进程」组合重试；全部失败回退直写并明确告警
+5. 失败则遍历全部「安全扩展名 × 可用进程」组合重试；
+   v1.9.0 起全部失败直接报错（SAFE_WRITE_FAILED），原文件保持不变，不再回退直写
 ```
 
 ### 探测与缓存
 
-- **首次启动（或缓存失效）自动探测**：依次用候选扩展名写入临时文件，通过「外部进程读磁盘原始字节 + 物理大小对比 + Node 读回对比」三重交叉验证分类；再探测可用的外部进程并做复制交叉验证
-- **探测全程在系统临时目录进行**，不污染用户目录；对未在候选清单中的扩展名，首次写入时按需即时探测（在目标文件所在目录进行，兼容按目录生效的策略）
-- **缓存位置**：`~/.mcp-encryption-profile.json`，按 machineId（hostname+username 哈希）绑定，**换电脑/换用户自动重新探测**；缓存有效期 30 天
-- **查看/刷新**：用 `encryption_profile` 工具查看当前探测结果；加密策略变更后用 `refresh_profile` 强制重探
-- **无外部进程可用时**（如进程被策略禁止 spawn）：自动降级为大小+读回对比探测，unsafe 写入回退直写并告警，不影响其他功能
+- **首次启动（或缓存失效）自动探测**：在系统临时目录用候选扩展名写入探测样本，通过「Node 读回对比 + 独立进程读磁盘指纹」分类；再探测可用的外部进程并做复制交叉验证
+- **目录级实时探测（v1.9.0）**：具体写入前按「目标目录 × 扩展名」在该目录内创建随机探测样本（`.mcp-probe-<uuid><ext>`，写完即删）实时分类，结果缓存在内存 scopes 中——加密策略按目录生效时结果也准确
+- **自动缓存位置**：`~/.mcp-encryption-profile.json`（结构 v3），按 machineId（hostname+username 哈希）绑定，**换电脑/换用户自动重新探测**；缓存有效期 30 天；v1/v2 旧缓存自动作废（v2 中的人工 protected 标注会一次性迁移到独立策略目录）
+- **人工策略独立存储**：`~/.mcp-file-policies/` 每个扩展名一个文件，刷新探测、TTL 过期、服务重启都不会删除人工标注
+- **查看/刷新**：用 `encryption_profile` 工具查看当前探测结果与人工策略；加密策略变更后用 `refresh_profile` 强制重探（只刷新自动探测，不动人工策略）；`inspect_write_strategy` 可预览某个目标路径将采用的写入策略而不修改目标文件
+- **无外部进程可用时**（如进程被策略禁止 spawn）：普通写入仍以 Node 侧指纹校验内容一致；强制 `writePolicy=plaintext` 时会明确报 `DISK_UNVERIFIED` 而不会谎称已落盘明文
 
-### 写入后实时重分类（v1.8.0+）
+### 写入策略（writePolicy）
 
-启动探测的分类结论是先验的（在系统临时目录采样），且 Node.js 白名单读回无法区分「真受控文档」与「伪受控」——两者在白名单进程里都能读到明文。1.8.0 起引入**写入后实测**兜底：
+write_file / edit_file / copy_path / move_path 均支持 `writePolicy` 参数：
 
-```
-写入完成 → 外部进程读目标文件磁盘前 16 字节
-  ├─ 与写入内容前缀一致 → 磁盘明文 → 扩展名重分类为 safe
-  ├─ 命中 %TSD 魔数     → 磁盘密文 → 扩展名重分类为 encrypted，
-  │                        并立即用 safeWrite 重写为明文（自动纠正）
-  └─ 检测不可用          → 保持原分类（无任何副作用）
-```
-
-- **首次写入新扩展名**：先直写，实测发现加密 → 自动重分类 + 立即纠正为明文，并提示已切换策略；第二次起该扩展名直接走 safeWrite
-- **目录级策略差异**：已知 safe/protected 的扩展名在写入后也会复测，策略被管理员调整或按目录生效时可自动纠正误分类
-- **用户标注优先**：`mark_extension` 标注为 protected 的扩展名保持加密直写，跳过自动纠正（适合 `.java` 这类需要保持加密状态的受控文档）；标注为 unsafe 的扩展名强制走 safeWrite 保持明文
-- **缓存结构 v2**：新增 `encryptedExtensions`（写入后实测密文的扩展名）与 `userProtectedExtensions`（用户标注），旧版缓存自动作废重探
+| 值 | 语义 |
+|----|------|
+| `auto`（默认） | 人工标注优先；否则按目标目录实时探测：safe 直写、protected 直写保持加密、unsafe 走 safeWrite |
+| `preserve` | 显式保持受控加密直写（等同人工标注 protected 的当次效果） |
+| `plaintext` | 强制磁盘明文：必须经 safeWrite 且由独立读取器验证完整磁盘指纹，验证失败则中止并保留原文件 |
 
 ### mark_extension 手动标注
 
-当自动分类不符合预期时手动干预（标注优先级高于一切自动分类）：
+当自动分类不符合预期时手动干预（标注优先级高于一切自动分类，独立持久化，重启/刷新不丢失）：
 
-| 场景                                         | 调用 | 效果 |
-|----------------------------------------------|------|------|
-| `.java` 需要保持 TSD 加密（company受控文档） | `mark_extension(".java", "protected")` | 直写保持加密，Notepad 打开正常，跳过写入后自动纠正 |
-| `.scss` 必须保持明文（自动误判为 protected） | `mark_extension(".scss", "unsafe")` | 强制走 safeWrite 保持明文 |
-| 恢复自动分类                                 | `mark_extension(".java", "clear")` | 清除手动标注 |
+| 场景 | 调用 | 效果 |
+|------|------|------|
+| `.java` 需要保持 TSD 加密（受控文档） | `mark_extension(".java", "protected")` | auto 策略下直写保持加密，Notepad 打开正常 |
+| `.scss` 必须保持明文（自动误判） | `mark_extension(".scss", "unsafe")` | auto 策略下强制走 safeWrite 保持明文 |
+| 恢复自动分类 | `mark_extension(".java", "clear")` | 写入墓碑清除标注，恢复实时探测 |
+
+## 写入保证（v1.9.0）
+
+所有文本修改（write_file / edit_file）与文件复制/移动都经过统一的可回滚提交流程：
+
+```
+改前指纹 → expectedHash/overwrite 校验 → 策略决策
+  → 同目录随机独占暂存 .mcp-stage-<uuid><ext>（外部进程中转时经安全扩展名）
+  → fsync 刷盘 → 再次比对改前指纹（防并发改动）
+  → 原文件 rename 为 .mcp-backup-<uuid><ext> → 暂存 rename 到位
+  → 独立指纹终验（SHA256+size；有独立读取器时含磁盘原始字节）
+  → 成功删除备份；任一步失败自动回滚，回滚失败返回 recoveryPath（备份不得删除）
+```
+
+- **完整载荷**：追加模式先在内存合成「原内容+新增」完整内容再走事务，纠正/重写不会丢原文与 BOM
+- **safeWrite 失败即中止**：不再回退直写破坏原文（SAFE_WRITE_FAILED，changed=false）
+- **跨实例锁**：同一路径的并发写入经 `.mcp-file-locks/` 互斥（等待 5 秒超时 FILE_BUSY）；`expectedHash` 可检测其他编辑器造成的版本变化（CONFLICT）
+- **断电/强杀残留**：两次 rename 之间的极端崩溃可能留下 `.mcp-backup-*` 与 `.mcp-stage-*`，先核对内容与时间再人工恢复，禁止直接批量清理
+- **复制/移动目录**：逐文件执行相同策略；移动先复制并二次比对指纹后再删除已验证的源文件；失败返回 `partial` 与 `sourceRetained`，不静默回退；符号链接明确拒绝；递归目标（目标在源内）明确拒绝
+- **diskState 三态**：`plaintext`（独立进程验证磁盘明文）、`preserved`（保持加密直写）、`unknown`（内容已校验但无独立读取器证明磁盘状态——不能当作「已证明明文」）
 
 ## 文件结构
 
@@ -101,16 +124,25 @@ AI Agent  --(MCP/stdio)-->  Node.js MCP Server  --(fs.readFileSync)-->  读取�
 mcp-read-file-server/
 ├── README.md         # 本文档
 ├── SKILL.md          # 配套 Skill（可选，让 AI 学会自动选用本工具）
-├── index.js          # MCP Server 主程序（含 shebang，可作可执行入口）
+├── index.js          # MCP Server stdio 入口（含 shebang，可作可执行入口）
+├── lib/              # 生产模块（encryption/files/text/patterns/regex/server）
+├── scripts/          # 开发检查工具（check.js：语法+LF 检查）
+├── test/             # 仓库内回归/协议/适配测试（不随包发布）
 ├── package.json      # 包配置（bin/files/依赖声明，可 npm publish）
 ├── .gitignore        # Git 忽略规则
 └── node_modules/     # 依赖（@modelcontextprotocol/sdk、zod，不随包发布）
 ```
 
+### 子目录说明
+
+**lib/（生产模块）**：文件操作 MCP 的生产源码模块，不是额外安装的工具。text 处理严格 UTF8 和分页；patterns 处理无回溯 glob 与字符串编辑；regex/regex-worker 隔离用户正则；encryption 处理探测和持久策略；files 处理路径、锁与提交回滚；server 注册 MCP 工具。通过项目入口 index.js 使用。依赖现有 Node>=20、MCP SDK 和 Zod，无新增生产直接依赖。卸载整个 npm 包时随包卸载，不应单独删除其中某个模块。
+
+**scripts/（开发检查工具）**：项目开发工具目录。check.js 检查 JS 语法与 LF 行尾，不执行功能测试。使用 `npm run check`。仅使用现有 Node 内置模块，无安装依赖。无需额外卸载；删除脚本前须同步修改 package.json 对应命令。
+
 ## 安装
 
 ### 前置条件
-- Node.js v18+（推荐 v20+）
+- Node.js v20+
 - Node.js 已被加密软件列为白名单进程
 
 ### 方式一：通过 npx 运行（推荐，无需手动安装）
@@ -128,10 +160,10 @@ npx -y mcp-read-file-server
 ```bash
 git clone https://github.com/hebulin/mcp-read-file-server.git
 cd mcp-read-file-server
-npm install
+npm ci
 ```
 
-此时配置中使用 `node` + 本地 `index.js` 绝对路径。
+此时配置中使用 `node` + 本地 `index.js` 绝对路径。本地修改不会自动更新 npm 上的包，测试本地代码请在客户端配置中直接指向本仓库入口。
 
 ## 配置
 
@@ -238,37 +270,51 @@ claude mcp list
 
 在各自设置界面的 MCP 配置中，添加上述 JSON 配置。
 
+### 环境变量（可选）
+
+| 环境变量 | 默认与说明 |
+|---------|-----------|
+| `MCP_BASE_DIR` | 服务启动目录；所有相对路径的基准 |
+| `MCP_ALLOWED_ROOTS` | 可选绝对路径 JSON 数组（如 `["D:/Projects"]`）；设置后所有文件操作限制在根目录内，未设置继承 Node 进程文件权限 |
+| `MCP_READ_ONLY` | `1` 禁用全部修改类工具（保留读操作；edit_file dryRun 仍可预览） |
+| `MCP_DISABLE_DELETE` | `1` 禁用 remove_path |
+| `MCP_PROFILE_DIR` | 探测缓存/人工策略/锁文件的存放目录，默认用户主目录；建议保持稳定，测试必须独立设置 |
+
 ## 提供的工具
+
+共 18 个工具。所有工具同时返回文本与统一 `structuredContent`：`{ ok, code, changed, data, warnings }`；错误时 `isError:true`，`code` 为机器可读错误码（如 `NO_MATCH` / `CONFLICT` / `SAFE_WRITE_FAILED` / `DISK_MISMATCH` / `FILE_BUSY`），并视情况附 `recoveryPath` / `partial` / `sourceRetained`。
 
 | 工具名 | 替代内置 | 功能 | 参数 |
 |--------|---------|------|------|
-| `read_file` | Read | 读取单个文件明文（超大文件自动截断） | `path` |
-| `read_files` | 多次 Read | 批量读取多个文件明文（数组或逗号分隔字符串） | `paths` |
-| `read_file_partial` | Read（局部） | 局部读取文件（前N字符 / 指定行范围） | `path`、`mode`、`charCount`、`startLine`、`endLine` |
-| `write_file` | Write | 写入文件（支持追加模式 / 行尾风格 / BOM 保留；unsafe 扩展名自动 safeWrite 明文落盘） | `path`、`content`、`mode`、`eol` |
-| `edit_file` | Edit/MultiEdit | 精确替换后写回（CRLF/LF 自动兼容、BOM 保留、正则多行模式、`edits` 批量原子编辑、失败附相似行诊断；unsafe 扩展名自动 safeWrite） | `path`、`oldString`、`newString`、`edits`、`useRegex`、`replaceAll`、`ignoreCase` |
-| `search_files` | Grep | 递归搜索文件内容（支持 `**` 目录通配、跳过二进制/超大文件） | `pattern`、`path`、`include`、`exclude`、`ignoreCase`、`onlyMatching`、`maxResults` |
-| `find_files` | Glob | 按文件名 glob 递归查找（如 `**/*.test.js`） | `pattern`、`path`、`maxResults` |
-| `list_directory` | LS | 列出目录内容（类型/大小/时间） | `path`、`showHidden` |
-| `copy_path` | bash cp | 复制文件/目录（递归；加密环境必须经白名单进程；unsafe 目标自动 safeCopy） | `source`、`destination` |
-| `move_path` | bash mv | 移动/重命名（跨盘符自动回退复制+删除；unsafe 目标自动明文落盘） | `source`、`destination` |
-| `remove_path` | bash rm | 删除文件/目录（默认递归，谨慎使用） | `path`、`recursive` |
+| `read_file` | Read | 读取单个文件明文（完整读取返回 hash，超 40 万字符截断返回 nextOffset） | `path` |
+| `read_files` | 多次 Read | 批量读取（最多 100 个文件，总 40 万字符预算，逐项状态） | `paths` |
+| `read_file_partial` | Read（局部） | 局部读取（字符模式带 offset 续页；行模式返回 nextLine） | `path`、`mode`、`charCount`、`offset`、`startLine`、`endLine` |
+| `write_file` | Write | 写入文件（完整载荷事务提交；追加/BOM/行尾跟随原文件） | `path`、`content`、`mode`、`eol`、`expectedHash`、`overwrite`、`writePolicy` |
+| `edit_file` | Edit/MultiEdit | 精确替换后写回（CRLF/LF 自动兼容、edits 批量原子、dryRun 预览、expectedMatches 计数保护） | `path`、`oldString`、`newString`、`edits`、`useRegex`、`replaceAll`、`ignoreCase`、`expectedMatches`、`expectedHash`、`dryRun`、`writePolicy` |
+| `search_files` | Grep | 递归搜索内容（literal/regex 双模式、上下文行、跳过二进制/超大文件） | `pattern`、`path`、`mode`、`include`、`exclude`、`ignoreCase`、`onlyMatching`、`contextLines`、`maxResults`、`showHidden` |
+| `find_files` | Glob | 按文件名 glob 递归查找（支持花括号与字面括号路径） | `pattern`、`path`、`maxResults` |
+| `list_directory` | LS | 列出目录内容（含 symlink 类型；offset/maxResults 分页） | `path`、`showHidden`、`offset`、`maxResults` |
+| `copy_path` | bash cp | 复制文件/目录（逐文件策略校验；overwrite=false 保护） | `source`、`destination`、`overwrite`、`writePolicy` |
+| `move_path` | bash mv | 移动/重命名（同路径保护；复制校验后才删源） | `source`、`destination`、`overwrite`、`writePolicy` |
+| `remove_path` | bash rm | 删除文件/目录（默认递归；dryRun 预览；保护根目录） | `path`、`recursive`、`dryRun` |
 | `create_directory` | - | 递归创建目录 | `path` |
-| `file_info` | - | 查询文件/目录信息（含明文大小、符号链接） | `path` |
-| `check_status` | - | 检查运行状态（可实测解密能力，输出含环境探测概要） | `path`（可选） |
-| `encryption_profile` | - | 查看环境探测结果（扩展名三分类、可用进程、最佳组合、缓存位置） | 无 |
-| `refresh_profile` | - | 强制重新探测环境并更新缓存（加密策略变更后使用） | 无 |
-| `mark_extension` | `extension`, `category` | 手动标注扩展名写入策略：protected=保持加密直写，unsafe=强制 safeWrite 明文，clear=清除标注 | 无 |
+| `file_info` | - | 查询文件信息（流式 SHA256 指纹、链接目标；calculateHash=false 仅查元数据） | `path`、`calculateHash` |
+| `check_status` | - | 心跳检查；传 path 实测读取（检出 %TSD 密文头会明示；expectedHash 提供可信对照） | `path`（可选）、`expectedHash`（可选） |
+| `encryption_profile` | - | 查看自动探测缓存与人工策略标注 | 无 |
+| `refresh_profile` | - | 强制重新探测（只刷新自动缓存，不动人工策略） | 无 |
+| `mark_extension` | - | 人工标注扩展名策略（protected/unsafe/clear，独立持久化） | `extension`、`category` |
+| `inspect_write_strategy` | - | 预览某目标路径将采用的写入策略（在目标目录探测，不修改目标文件） | `path`、`writePolicy` |
 
 ### `read_file_partial` 参数详解
 
 | 参数 | 类型 | 必填 | 默认 | 说明 |
 |------|------|------|------|------|
-| `path` | string | ✅ | - | 文件路径，支持相对路径或绝对路径 |
-| `mode` | enum: `chars` / `lines` | ✅ | - | 读取模式：`chars`=按字符数读取前N个字符；`lines`=按行号读取指定行或行范围 |
+| `path` | string | 是 | - | 文件路径，支持相对路径或绝对路径 |
+| `mode` | enum: `chars` / `lines` | 是 | - | 读取模式：`chars`=按字符数读取；`lines`=按行号读取指定行或行范围 |
 | `charCount` | number | `mode=chars` 时必填 | - | 读取前 N 个字符 |
+| `offset` | number | 否 | 0 | 字符模式续页位置（须使用上次返回的 `nextOffset`，不能自行换算字节偏移） |
 | `startLine` | number | `mode=lines` 时必填 | - | 起始行号（从 1 开始） |
-| `endLine` | number | ❌ | =`startLine` | 结束行号（含该行）。不传则只读取 `startLine` 一行 |
+| `endLine` | number | 否 | =`startLine` | 结束行号（含该行）。不传则只读取 `startLine` 一行 |
 
 **使用示例：**
 
@@ -276,7 +322,7 @@ claude mcp list
 - 读取第 10 行：`mode="lines"`, `startLine=10`
 - 读取第 5-20 行：`mode="lines"`, `startLine=5`, `endLine=20`
 
-> 返回内容会带文件名、读取范围、总字符数/总行数的头部信息，行模式下每行带行号前缀。超出文件范围时自动截断并提示。
+> 返回内容会带文件名、读取范围、总行数的头部信息，行模式下每行带行号前缀。超出文件范围时自动截断并提示；行模式流式扫描返回 `nextLine` 供续页。
 
 ### `edit_file` 换行符自动兼容
 
@@ -284,10 +330,11 @@ Windows 下文件多为 CRLF 换行，而 AI Agent 生成的多行 `oldString` �
 
 - **匹配阶段**：先按字节原样精确匹配；未命中时自动将文件与 `oldString` 的换行符统一归一（`\r\n` / `\r` / `\n` 均视为换行）后再匹配，两种风格任意组合均可命中
 - **写入阶段**：`newString` 的行尾会自动转换为文件本身的主导换行风格，不会把 CRLF 文件改写为 LF 混行
-- **提示信息**：触发换行适配时，返回结果会附 `ℹ️ 换行符已自动适配` 说明，方便排查
 - **BOM 自动处理**：UTF-8 BOM 读取时自动剥离、写回时自动补回，`oldString` 无需关心 BOM
-- **正则模式默认多行**：`useRegex=true` 时自动附加 `m` 标志，`^xxx` / `xxx$` 按行锚定
-- **批量原子编辑（edits 数组）**：一次调用完成多处修改，按序应用；**任一条目失败则整体不写盘**，不会产生「半改状态」。条目按文件现状顺序构造（前面条目的结果参与后续条目匹配）
+- **正则模式默认多行**：`useRegex=true` 时自动附加 `m` 标志，`^xxx` / `xxx$` 按行锚定；正则在独立 worker 中执行（默认 1 秒预算），超时/取消不影响服务继续响应
+- **批量原子编辑（edits 数组）**：一次调用完成多处修改（1–200 条），按序应用；**任一条目失败则整体不写盘**，不会产生「半改状态」。条目按文件现状顺序构造（前面条目的结果参与后续条目匹配）
+- **dryRun 预览**：`dryRun=true` 返回 matched/replaced/原文与提议 hash 及差异片段，不写盘
+- **expectedMatches 计数保护**：声明期望替换处数，实际不符即失败（MATCH_COUNT_MISMATCH）不写盘，防止误替换
 - **失败附相似行诊断**：字符串匹配失败时返回「可能相关的行」及相似度，直接对照排查空白/缩进差异，无需盲目重试
 
 注意：该兼容仅针对换行符差异，空格、缩进等其他空白字符仍需与原文完全一致。含反引号 `` ` `` 与 `${}` 的内容直接原样传参（JSON 传输无 JS 模板字面量转义问题）。
@@ -295,11 +342,12 @@ Windows 下文件多为 CRLF 换行，而 AI Agent 生成的多行 `oldString` �
 ### 其他内置保护
 
 - **预算读取（性能）**：`read_file` / `read_files` / `read_file_partial`(chars 模式) 只读取需要的字节数而非整个文件。读取 100MB 大文件的前 40 万字符从 ~160ms/100MB 内存降到 ~3ms/1.5MB 内存
-- **编码防损坏**：UTF-16 文件（BOM/字节特征检测）直接拒绝读取并提示转换；疑似非 UTF-8（GBK 等，含大量乱码替换字符）的文件 `edit_file` 拒绝编辑写回，防止不可逆损坏
+- **编码防损坏**：严格 UTF-8 增量解码（合法中文跨字节边界不损坏）；UTF-16、GBK/非法 UTF-8、含 NUL 的二进制拒绝进入文本编辑/追加流程，防止不可逆损坏
 - **大文件截断**：`read_file` / `read_files` 单文件超过 40 万字符自动截断，提示改用 `read_file_partial` 分页读取，避免撑爆上下文
-- **二进制/超大文件跳过**：`search_files` 只预读首 8KB 判定二进制（图片/exe 含 NUL 字节）后即跳过，超过 5MB 的文件也跳过，并在结果中说明跳过数量
-- **隐藏文件默认跳过**：`search_files` / `find_files` 默认跳过 `.` 开头的文件与目录（避免把 `.env` 等敏感内容灌入上下文），忽略目录还包含 `node_modules`、`.git`、`target`、`build`、`dist`、`vendor` 等；`list_directory` 可用 `showHidden=true` 显示
-- **glob 支持 `{a,b}` 花括号**：`find_files` / `search_files` 的 include 支持 `src/**/*.{ts,tsx}` 这类 Agent 高频写法
+- **二进制/超大文件跳过**：`search_files` 只预读首块判定二进制后即跳过，超过 5MB 的文件也跳过，并在结果 skipped 中说明数量
+- **隐藏文件默认跳过**：`search_files` / `find_files` 默认跳过 `.` 开头的文件与目录（避免把 `.env` 等敏感内容灌入上下文），忽略目录还包含 `node_modules`、`.git`、`target`、`build`、`dist`、`vendor` 等（可用 `showHidden`/`useDefaultIgnore` 控制）；`list_directory` 可用 `showHidden=true` 显示
+- **glob 支持 `{a,b}` 花括号**：`find_files` / `search_files` 的 include 支持 `src/**/*.{ts,tsx}` 这类 Agent 高频写法；不含路径分隔符的 include 按文件名匹配，含 `/` 的按相对路径匹配
+- **主要预算**：字符页 40 万；文本整文件编辑/覆盖/追加 16MB；读取页最多扫描 64MB；搜索单文件 5MB、总输出 40 万字符、最多 2000 条；遍历最多 10 万项/128 层；目录复制/移动最多 1 万项；工具超时 `timeoutMs` 默认 15000（100–60000）
 
 ## 使用
 
@@ -332,19 +380,23 @@ find_files 之外的文件名查找也优先用 MCP 工具。
 
 ## 使用规则
 1. 会话开始先调 check_status 确认白名单解密正常；环境不明时调
-   encryption_profile 查看本机扩展名分类（safe/protected/unsafe/encrypted）与可用进程。
+   encryption_profile 查看本机扩展名分类与人工策略；
+   写入前可用 inspect_write_strategy 预览目标路径的写入策略。
 2. 写任何扩展名的文件都不用关心加密细节：write_file/edit_file/copy_path/
-   move_path 已内置环境自适应与写入后实时检测——写入后磁盘为密文的扩展名
-   会被自动识别并立即重写为明文，后续同类文件自动走 safeWrite。
-3. 需要保持加密状态的扩展名（如受控的 .java 文档）：用
-   mark_extension(".java", "protected") 标注一次即可，之后写入直写保持加密；
-   反之若某扩展名被误判导致写入后变密文，用 mark_extension(".ext", "unsafe")
-   强制保持明文。标注一次永久生效（缓存在本机）。
+   move_path 默认 writePolicy=auto，按目标目录实时探测并自动选择直写或
+   safeWrite；需要保持加密用 writePolicy=preserve，需要强制磁盘明文用
+   writePolicy=plaintext（失败会中止并保留原文件，不会回退直写）。
+3. 需要长期保持加密/明文的扩展名：用 mark_extension(".java", "protected")
+   或 mark_extension(".scss", "unsafe") 标注一次永久生效（独立存储，
+   重启与刷新探测不丢失）；mark_extension(".ext", "clear") 恢复自动。
 4. edit_file 前必须先 read_file 拿原文，oldString 从原文原样复制
-   （含空格与缩进；CRLF/LF 换行差异会自动兼容，无需手工处理）。
+   （含空格与缩进；CRLF/LF 换行差异会自动兼容，无需手工处理）；
+   重要修改先 dryRun=true 预览；可用 expectedHash 防止覆盖他人改动。
 5. 路径一律使用绝对路径。
-6. 若写工具返回「safeWrite 失败/回退直接写入」告警，先调 refresh_profile
-   重新探测环境，再重试写入；仍失败则把告警原文报告给用户。
+6. 写工具返回 isError 时先看 structuredContent 的 code：
+   SAFE_WRITE_FAILED/DISK_MISMATCH 说明明文落盘失败（原文件未动），
+   先调 refresh_profile 重新探测再重试；出现 recoveryPath 说明回滚
+   也失败，保留该备份并报告用户，禁止盲目重试或删除备份。
 7. edit_file 匹配失败时，按返回的「可能相关的行」诊断修正 oldString，
    不要盲目重试。
 ```
@@ -422,9 +474,20 @@ cp SKILL.md ~/.openclaw/skills/encryption-file-ops/SKILL.md
 
 ## 在新电脑上使用
 
-已发布到 npm，新电脑上**无需拷贝文件**，只要装了 Node.js（v18+），直接配置 Agent 使用 `npx -y mcp-read-file-server` 即可。
+已发布到 npm，新电脑上**无需拷贝文件**，只要装了 Node.js（v20+），直接配置 Agent 使用 `npx -y mcp-read-file-server` 即可。
 
 > 若需离线使用或二次开发，再按「安装 -> 方式二」从源码克隆运行。
+
+## 开发与验证
+
+```powershell
+npm ci
+npm run check    # 语法 + LF 行尾检查
+npm test         # 仓库内回归/协议/适配测试（Node 内置 test runner）
+npm audit --omit=dev
+```
+
+测试位于 `test/`（regression/protocol/adapters 三个套件，模拟磁盘错误与真实 stdio 协议分离，不触碰真实 profile）；CI 覆盖 Windows/Linux × Node 20/22/24。运行依赖：MCP SDK 1.30.0、Zod 4.4.3（间接依赖 fast-uri/qs 通过 overrides 限定修复版本）。
 
 ## 故障排查
 
@@ -439,7 +502,7 @@ cp SKILL.md ~/.openclaw/skills/encryption-file-ops/SKILL.md
 ```bash
 # 验证 Node.js 和依赖
 node --version
-cd mcp-read-file-server && npm install
+cd mcp-read-file-server && npm ci
 
 # 测试启动
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}' | node index.js
@@ -450,12 +513,21 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 该扩展名在本机属于 unsafe 类型（加密但不自动解密）。v1.7.0+ 会自动走 safeWrite 规避；若仍出现乱码：
 
 1. 调 `refresh_profile` 强制重新探测（策略可能变更或缓存过期）
-2. 调 `encryption_profile` 确认该扩展名已被正确识别为 unsafe、且存在可用外部进程与 bestCombo
+2. 调 `encryption_profile` 确认该扩展名分类与可用外部进程；或对该扩展名直接 `mark_extension(".scss", "unsafe")` 强制明文
 3. 若显示「可用外部进程: （无）」，说明 MCP Server 进程被策略禁止 spawn 子进程，需联系管理员放行 powershell/cmd，或接受直写加密后由白名单应用打开
 
-### 写工具返回「safeWrite 失败，已回退直接写入」告警
+### 写工具返回 SAFE_WRITE_FAILED / DISK_MISMATCH
 
-说明所有「安全扩展名 × 外部进程」组合都验证失败（常见原因：外部进程对目标目录无写权限）。处理：调 `refresh_profile` 重探；检查目标目录权限；换目录重试。回退写入的文件在本机可能显示乱码，建议删除后重新写入。
+v1.9.0 起 safeWrite 失败**不再回退直写**（保护原文件，返回 `changed:false`）。说明所有「安全扩展名 × 外部进程」组合都验证失败（常见原因：外部进程对目标目录无写权限，或独立读取器验证磁盘指纹不一致）。处理：调 `refresh_profile` 重探；检查目标目录权限；确认 powershell/cmd 可被执行；换目录重试。
+
+### 写工具返回 FILE_BUSY / CONFLICT
+
+- `FILE_BUSY`：另一个 MCP 实例正在写同一路径（锁位于 `~/.mcp-file-locks/`）。确认对方进程结束后重试；仅当确认锁属主进程已退出时才可人工删除残留锁文件
+- `CONFLICT`：传入的 `expectedHash` 与文件当前指纹不一致——文件在您读取后被其他进程改过。重新 read_file 后再编辑
+
+### 回滚失败返回 recoveryPath
+
+极端情况（断电/强杀/磁盘错误）下自动回滚也失败时会返回 `recoveryPath`——这是原文件的备份路径，**必须保留**。先核对备份内容与时间，人工恢复后再排查；禁止直接批量清理 `.mcp-backup-*` / `.mcp-stage-*`。
 
 ### Agent 连不上 MCP Server
 
