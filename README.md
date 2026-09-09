@@ -8,6 +8,8 @@
 
 **v1.9.0 可回滚写入与目录级策略**：全部文本修改改为「完整载荷 → 独占暂存 → 独立指纹校验 → 原文件备份 → 提交 → 最终校验」事务流程，失败自动回滚，回滚失败保留 `recoveryPath`；加密策略按「目标目录 × 扩展名」实时探测，人工标注（`mark_extension`）独立持久化到 `.mcp-file-policies/`，刷新探测/重启/TTL 过期均不丢失；safeWrite 失败不再回退直写（保护原文）；复制/移动目录逐文件执行相同策略；所有工具返回统一 `structuredContent`（ok/code/changed/data/warnings）。
 
+**v1.9.1 边界修复**：目录复制/移动拒绝双向祖先重叠，避免覆盖未读取的源文件；回滚失败和部分删源正确保留 `changed` / `partial`；行分页无法容纳首行时明确报错，到达请求结束行即停止解析，避免被范围外长行影响。Hono 间接依赖更新至 4.13.5。
+
 ## 适用场景
 
 电脑安装了文件加密软件（如天锐绿盾、IP-Guard、亿赛通、深信服等），磁盘上的文件是密文。AI Agent（Claude Code、Cursor、Windsurf、Cline 等）是独立进程，内置文件工具不在白名单内，只能读到密文。而 Node.js 进程在白名单内，通过 MCP Server 提供的替代工具可以正常读写明文。
@@ -115,7 +117,7 @@ write_file / edit_file / copy_path / move_path 均支持 `writePolicy` 参数：
 - **safeWrite 失败即中止**：不再回退直写破坏原文（SAFE_WRITE_FAILED，changed=false）
 - **跨实例锁**：同一路径的并发写入经 `.mcp-file-locks/` 互斥（等待 5 秒超时 FILE_BUSY）；`expectedHash` 可检测其他编辑器造成的版本变化（CONFLICT）
 - **断电/强杀残留**：两次 rename 之间的极端崩溃可能留下 `.mcp-backup-*` 与 `.mcp-stage-*`，先核对内容与时间再人工恢复，禁止直接批量清理
-- **复制/移动目录**：逐文件执行相同策略；移动先复制并二次比对指纹后再删除已验证的源文件；失败返回 `partial` 与 `sourceRetained`，不静默回退；符号链接明确拒绝；递归目标（目标在源内）明确拒绝
+- **复制/移动目录**：逐文件执行相同策略；移动先复制并二次比对指纹后再删除已验证的源文件；失败返回 `partial` 与 `sourceRetained`，不静默回退；符号链接明确拒绝；源和最终目标存在任一方向的祖先关系时拒绝，相同路径保持不变。回滚失败时 `changed=true`，`partial` 包含当前失败目标，原备份通过 `recoveryPath` 返回
 - **diskState 三态**：`plaintext`（独立进程验证磁盘明文）、`preserved`（保持加密直写）、`unknown`（内容已校验但无独立读取器证明磁盘状态——不能当作「已证明明文」）
 
 ## 文件结构
@@ -322,7 +324,7 @@ claude mcp list
 - 读取第 10 行：`mode="lines"`, `startLine=10`
 - 读取第 5-20 行：`mode="lines"`, `startLine=5`, `endLine=20`
 
-> 返回内容会带文件名、读取范围、总行数的头部信息，行模式下每行带行号前缀。超出文件范围时自动截断并提示；行模式流式扫描返回 `nextLine` 供续页。
+> 行模式文本带行号，结构化结果含 `lines`、`nextLine`、`truncated`、`totalLines`。到达请求结束行即停止；未扫描到 EOF 时 `totalLines=null`，`nextLine` 是待确认的续读起点，可能已超过 EOF（下一次调用会明确报 `LINE_OUT_OF_RANGE`）。首行加上行号开销超过页预算时返回 `LINE_TOO_LONG`，请改用字符分页，不会返回游标不前进的成功空页。
 
 ### `edit_file` 换行符自动兼容
 
