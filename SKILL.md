@@ -20,7 +20,7 @@ description: 在Node.js为加密软件白名单进程的环境中，使用文件
 ## 必须理解的结果
 
 1. 优先读取structuredContent的ok、code、changed、data和warnings，不能只看人类文本。
-2. isError=true时可能存在目录操作部分目标；查看partial/sourceRetained。单文件回滚失败时查看recoveryPath并保留备份。
+2. isError=true时可能存在目录操作部分目标；查看changed/partial/sourceRetained。递归删除还需查看removedCount/partialTruncated/failedPath。单文件回滚失败时查看recoveryPath并保留备份。cleanupErrors只是清理诊断，成功修改后不得因清理告警重复追加。
 3. contentVerified表示Node可见内容一致；diskVerified才表示独立读取器的完整磁盘指纹一致。unknown不能声称已落盘明文。
 4. check_status基础调用不探测环境。文件可读取也不能直接推断解密正常，可信expectedHash匹配才提供明确内容对照。
 5. 文本工具只支持有效UTF8；UTF16、GBK、非法字节或NUL被拒绝时，必须先明确转换编码，不能强制按UTF8写回。
