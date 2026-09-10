@@ -8,6 +8,12 @@
 
 **v1.9.0 可回滚写入与目录级策略**：全部文本修改改为「完整载荷 → 独占暂存 → 独立指纹校验 → 原文件备份 → 提交 → 最终校验」事务流程，失败自动回滚，回滚失败保留 `recoveryPath`；加密策略按「目标目录 × 扩展名」实时探测，人工标注（`mark_extension`）独立持久化到 `.mcp-file-policies/`，刷新探测/重启/TTL 过期均不丢失；safeWrite 失败不再回退直写（保护原文）；复制/移动目录逐文件执行相同策略；所有工具返回统一 `structuredContent`（ok/code/changed/data/warnings）。
 
+**v1.9.1 边界修复**：目录复制/移动拒绝双向祖先重叠，避免覆盖未读取的源文件；回滚失败和部分删源正确保留 `changed` / `partial`；行分页无法容纳首行时明确报错，到达请求结束行即停止解析，避免被范围外长行影响。Hono 间接依赖更新至 4.13.5。
+
+**v1.9.2 并发与异常修复**：目录与子路径操作跨实例互斥，无关路径仍可并行；提交及锁清理错误单独记录为 `cleanupErrors`，保留真实修改状态与恢复路径；递归删除逐项记录部分结果；字面量替换在可终止工作线程中一次拼接，并在预览或提交前检查时间预算。
+
+**v1.9.3 补充修复**：工作根保护同时识别配置别名和真实路径，并拒绝操作包含受保护根的祖先；移动失败时计入已经删除的源目录；策略探测参与父目录锁；目录操作失败保留之前子项的清理诊断；glob去重、累计限额并分批让出主线程，避免过滤条件绕过超时或阻塞心跳。
+
 ## 适用场景
 
 电脑安装了文件加密软件（如天锐绿盾、IP-Guard、亿赛通、深信服等），磁盘上的文件是密文。AI Agent（Claude Code、Cursor、Windsurf、Cline 等）是独立进程，内置文件工具不在白名单内，只能读到密文。而 Node.js 进程在白名单内，通过 MCP Server 提供的替代工具可以正常读写明文。
@@ -38,9 +44,10 @@ AI Agent  --(MCP/stdio)-->  Node.js MCP Server(index.js)  --(lib/ 模块)-->  fs
 - `index.js` 仅负责 stdio 启动与正则 worker 回收
 - `lib/encryption.js` 目录级加密探测、写入策略决策、safeWrite 组合与独立指纹校验
 - `lib/files.js` 路径边界、跨实例锁、可回滚提交（暂存→备份→rename→终验）、目录逐文件复制/移动
+- `lib/locks.js` 登记路径及子树占用；`lib/cleanup.js` 保留主操作结果并收集清理错误
 - `lib/text.js` 严格 UTF-8 增量解码与流式分页
 - `lib/patterns.js` 无回溯 glob 与保留原索引的字符串替换
-- `lib/regex.js` / `lib/regex-worker.js` 用户正则在可终止 worker 中执行（默认 1 秒预算）
+- `lib/regex.js` / `lib/regex-worker.js` 用户正则与字面量编辑在可终止 worker 中执行（单次计算默认最多 1 秒，并受请求总预算约束）
 - `lib/server.js` 注册全部 18 个 MCP 工具，统一 structuredContent 与超时/只读包装
 
 ## 环境自适应（v1.7.0+）
@@ -113,9 +120,14 @@ write_file / edit_file / copy_path / move_path 均支持 `writePolicy` 参数：
 
 - **完整载荷**：追加模式先在内存合成「原内容+新增」完整内容再走事务，纠正/重写不会丢原文与 BOM
 - **safeWrite 失败即中止**：不再回退直写破坏原文（SAFE_WRITE_FAILED，changed=false）
-- **跨实例锁**：同一路径的并发写入经 `.mcp-file-locks/` 互斥（等待 5 秒超时 FILE_BUSY）；`expectedHash` 可检测其他编辑器造成的版本变化（CONFLICT）
+- **跨实例锁**：使用同一 `MCP_PROFILE_DIR` 的实例经 `.mcp-file-locks/` 登记整组路径，同路径及祖先/后代相互排斥，无关路径可并行（等待 5 秒超时 FILE_BUSY）；`expectedHash` 可检测其他编辑器造成的版本变化（CONFLICT）。升级到 1.9.2 时应重启全部 MCP 实例，避免旧版进程继续使用不同的锁协议
+- **清理状态**：提交或锁清理失败会附带 `cleanupErrors`；主操作已成功时保留成功结果和真实 `changed`，错误时保留原错误及 `recoveryPath`。不要因清理告警重复追加内容
+- **递归删除**：逐项执行，失败时返回 `changed`、`partial`（最多100项）、`removedCount`、`partialTruncated`、`failedPath`；受一万项和128层预算限制，不是整树事务
 - **断电/强杀残留**：两次 rename 之间的极端崩溃可能留下 `.mcp-backup-*` 与 `.mcp-stage-*`，先核对内容与时间再人工恢复，禁止直接批量清理
-- **复制/移动目录**：逐文件执行相同策略；移动先复制并二次比对指纹后再删除已验证的源文件；失败返回 `partial` 与 `sourceRetained`，不静默回退；符号链接明确拒绝；递归目标（目标在源内）明确拒绝
+- **复制/移动目录**：逐文件执行相同策略；移动先复制并二次比对指纹后再删除已验证的源文件；失败返回 `partial` 与 `sourceRetained`，不静默回退；符号链接明确拒绝；源和最终目标存在任一方向的祖先关系时拒绝，相同路径保持不变。回滚失败时 `changed=true`，`partial` 包含当前失败目标，原备份通过 `recoveryPath` 返回
+- **移动失败的源变化**：`sourceRetained` 表示本次是否尚未删除任何源文件或源目录；`removedSourceCount`、`removedSourcePaths`（最多100项）、`removedSourcePathsTruncated` 报告已经删除的源项。失败仍保留已完成子项的 `cleanupErrors`
+- **策略探测互斥**：`inspect_write_strategy` 持有目标父目录锁，创建和清理探测样本完成后才允许该目录被复制、移动或删除
+- **glob总预算**：生产搜索与查找使用异步匹配，合并重复模式和分支；一次请求的展开后累计长度最多10万，编译和全部路径匹配共用5000万工作单元预算。约每16384工作单元让出事件循环，检查取消与截止时间；超过限额返回 `GLOB_LIMIT`，超时返回 `TIMEOUT`
 - **diskState 三态**：`plaintext`（独立进程验证磁盘明文）、`preserved`（保持加密直写）、`unknown`（内容已校验但无独立读取器证明磁盘状态——不能当作「已证明明文」）
 
 ## 文件结构
@@ -322,7 +334,7 @@ claude mcp list
 - 读取第 10 行：`mode="lines"`, `startLine=10`
 - 读取第 5-20 行：`mode="lines"`, `startLine=5`, `endLine=20`
 
-> 返回内容会带文件名、读取范围、总行数的头部信息，行模式下每行带行号前缀。超出文件范围时自动截断并提示；行模式流式扫描返回 `nextLine` 供续页。
+> 行模式文本带行号，结构化结果含 `lines`、`nextLine`、`truncated`、`totalLines`。到达请求结束行即停止；未扫描到 EOF 时 `totalLines=null`，`nextLine` 是待确认的续读起点，可能已超过 EOF（下一次调用会明确报 `LINE_OUT_OF_RANGE`）。首行加上行号开销超过页预算时返回 `LINE_TOO_LONG`，请改用字符分页，不会返回游标不前进的成功空页。
 
 ### `edit_file` 换行符自动兼容
 
@@ -522,7 +534,7 @@ v1.9.0 起 safeWrite 失败**不再回退直写**（保护原文件，返回 `ch
 
 ### 写工具返回 FILE_BUSY / CONFLICT
 
-- `FILE_BUSY`：另一个 MCP 实例正在写同一路径（锁位于 `~/.mcp-file-locks/`）。确认对方进程结束后重试；仅当确认锁属主进程已退出时才可人工删除残留锁文件
+- `FILE_BUSY`：另一个 MCP 实例正在操作同一路径、父目录或子路径（锁位于 `~/.mcp-file-locks/`）。确认对方进程结束后重试；异常退出时仅在核对记录中的 PID 后处理残留 `.lock` 或 `.registry-guard`。`LOCK_CLEANUP_FAILED` 和 `cleanupErrors` 会给出未清理路径，不应直接清空整个锁目录
 - `CONFLICT`：传入的 `expectedHash` 与文件当前指纹不一致——文件在您读取后被其他进程改过。重新 read_file 后再编辑
 
 ### 回滚失败返回 recoveryPath
