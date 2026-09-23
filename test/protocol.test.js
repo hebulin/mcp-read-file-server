@@ -32,10 +32,12 @@ test('真实stdio：18个工具注册、输入输出schema和全部基础文件�
   assert.equal(tools.tools.length, 18);
   assert.ok(tools.tools.every(tool => tool.inputSchema && tool.outputSchema));
   assert.equal(client.getServerVersion().version, require('../package.json').version);
+  // 此协议夹具故意不配置外部读取器，显式preserve验证基础工具协议；auto拒绝路径另行覆盖。
+  const writePolicy = 'preserve';
   const file = path.join(f.root, 'hello.txt');
-  data(await client.callTool({ name: 'write_file', arguments: { path: file, content: 'hello\r\nworld\r\n' } }));
+  data(await client.callTool({ name: 'write_file', arguments: { path: file, content: 'hello\r\nworld\r\n', writePolicy } }));
   assert.equal(data(await client.callTool({ name: 'read_file', arguments: { path: file } })).content, 'hello\nworld\n');
-  data(await client.callTool({ name: 'edit_file', arguments: { path: file, oldString: 'hello\nworld', newString: 'first\nsecond' } }));
+  data(await client.callTool({ name: 'edit_file', arguments: { path: file, oldString: 'hello\nworld', newString: 'first\nsecond', writePolicy } }));
   assert.equal(data(await client.callTool({ name: 'read_file_partial', arguments: { path: file, mode: 'lines', startLine: 2 } })).lines[0].text, 'second');
   assert.equal(data(await client.callTool({ name: 'read_files', arguments: { paths: [file] } })).entries.length, 1);
   assert.equal(data(await client.callTool({ name: 'search_files', arguments: { path: file, pattern: 'second', include: '*.txt' } })).results.length, 1);
@@ -44,8 +46,8 @@ test('真实stdio：18个工具注册、输入输出schema和全部基础文件�
   assert.ok(data(await client.callTool({ name: 'file_info', arguments: { path: file } })).hash);
   const copied = path.join(f.root, 'copy.txt');
   const moved = path.join(f.root, 'moved.txt');
-  data(await client.callTool({ name: 'copy_path', arguments: { source: file, destination: copied } }));
-  data(await client.callTool({ name: 'move_path', arguments: { source: copied, destination: moved } }));
+  data(await client.callTool({ name: 'copy_path', arguments: { source: file, destination: copied, writePolicy } }));
+  data(await client.callTool({ name: 'move_path', arguments: { source: copied, destination: moved, writePolicy } }));
   assert.equal(data(await client.callTool({ name: 'remove_path', arguments: { path: moved, dryRun: true } })).changed, false);
   data(await client.callTool({ name: 'remove_path', arguments: { path: moved } }));
   data(await client.callTool({ name: 'create_directory', arguments: { path: path.join(f.root, 'empty') } }));
@@ -60,6 +62,24 @@ test('真实stdio：18个工具注册、输入输出schema和全部基础文件�
   assert.equal(tooLarge.isError, true);
   const invalidMark = await client.callTool({ name: 'mark_extension', arguments: { extension: '../evil', category: 'unsafe' } });
   assert.equal(invalidMark.isError, true);
+});
+
+test('真实stdio：无外部读取器时Windows auto拒绝写入并保留基线，显式策略可用', async t => {
+  const f = await fixture(t);
+  const file = await f.sample('unverified.custom', 'ORIGINAL');
+  const client = await connect(t, f);
+  const response = await client.callTool({ name: 'write_file', arguments: { path: file, content: 'NEW' } });
+  if (process.platform === 'win32') {
+    assert.equal(response.structuredContent.code, 'DISK_UNVERIFIED');
+    assert.equal(response.structuredContent.changed, false);
+    assert.equal(await fs.readFile(file, 'utf8'), 'ORIGINAL');
+  } else {
+    assert.equal(data(response).diskState, 'unknown');
+    assert.ok(response.structuredContent.warnings.length);
+  }
+  const explicit = await client.callTool({ name: 'write_file', arguments: { path: file, content: 'EXPLICIT', writePolicy: 'preserve' } });
+  assert.equal(data(explicit).strategy.basis, 'explicit');
+  assert.ok(explicit.structuredContent.warnings.some(w => w.includes('IDEA')));
 });
 
 test('真实stdio：正则计算中tools/list继续响应，超时后仍能读取文件', async t => {
