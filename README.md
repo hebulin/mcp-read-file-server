@@ -4,15 +4,26 @@
 
 加密环境文件操作工具。当 Node.js 是加密软件白名单进程时，通过 fs 模块自动解密读写文件明文，替代 AI Agent 内置文件工具，解决加密环境下读到密文的问题。适用于任何支持 MCP 协议的 AI Agent。
 
-**v1.7.0 环境自适应**：自动探测本机加密策略（哪些扩展名会被透明加密、哪些进程可用），对「会被加密且无法解密」的扩展名自动走 safeWrite 中转落盘明文，无需任何手工配置，换电脑自动重新探测。详见下文「环境自适应」。
+## 最新版本：2.1.0（相对 1.0）
 
-**v1.9.0 可回滚写入与目录级策略**：全部文本修改改为「完整载荷 → 独占暂存 → 独立指纹校验 → 原文件备份 → 提交 → 最终校验」事务流程，失败自动回滚，回滚失败保留 `recoveryPath`；加密策略按「目标目录 × 扩展名」实时探测，人工标注（`mark_extension`）独立持久化到 `.mcp-file-policies/`，刷新探测/重启/TTL 过期均不丢失；safeWrite 失败不再回退直写（保护原文）；复制/移动目录逐文件执行相同策略；所有工具返回统一 `structuredContent`（ok/code/changed/data/warnings）。
+本节以仓库 `v1.0` 标签（包版本 `1.0.0`）为基线，汇总当前版本的变化，不再逐条保留中间版本的更新说明。
 
-**v1.9.1 边界修复**：目录复制/移动拒绝双向祖先重叠，避免覆盖未读取的源文件；回滚失败和部分删源正确保留 `changed` / `partial`；行分页无法容纳首行时明确报错，到达请求结束行即停止解析，避免被范围外长行影响。Hono 间接依赖更新至 4.13.5。
+| 方面 | 1.0 | 2.1.0 |
+|------|-----|-------|
+| 文件写入 | 由 Node 直接读改写，依赖本机透明加密行为 | 统一暂存、备份、提交及终验；失败回滚，恢复失败保留 `recoveryPath` |
+| 加密策略 | 没有按原文件状态选择写入策略 | `auto` 比较原文件的 Node 与外部读取视图：原明文继续验证明文，原受保护文件保留受控写入；新建文件不凭 Node 可读就自动加密 |
+| 工具范围 | 8 个基础读写、搜索及目录工具 | 18 个工具，增加分页、列目录、文件查找、复制/移动/删除和 4 个策略诊断/管理工具 |
+| 编辑准确性 | 单次字符串或正则替换 | 批量原子编辑、CRLF/LF 适配、BOM 保留、预览、预期匹配数和 hash 冲突保护 |
+| 读取与性能 | 同步文件操作和基础搜索 | 异步 I/O、流式分页、有界输出；正则与字面量计算在可终止 worker 中执行；glob 累计预算并让出主线程 |
+| 并发与异常 | 基础异常返回 | 跨实例路径/子树锁；目录逐文件校验；部分完成、源保留、回滚和清理错误分别报告 |
+| 边界保护 | 主要依赖进程文件权限 | 可配置允许根、只读和禁删；识别真实路径/链接及受保护根；拒绝目录双向祖先重叠 |
+| 分发与验证 | 本地脚本启动，无仓库测试套件 | npm CLI 入口、模块化源码、结构化响应、回归/真实 stdio/Windows 适配测试及 CI；最低 Node.js 20 |
 
-**v1.9.2 并发与异常修复**：目录与子路径操作跨实例互斥，无关路径仍可并行；提交及锁清理错误单独记录为 `cleanupErrors`，保留真实修改状态与恢复路径；递归删除逐项记录部分结果；字面量替换在可终止工作线程中一次拼接，并在预览或提交前检查时间预算。
+**本次重点修复**：原始明文文件经 MCP 编辑后出现加密内容，而 Node 读回正常、编辑器却显示密文。修复基于每个文件的写入前状态，适用于所有扩展名、未知后缀、无扩展名和点文件。文本工具仍只接受有效 UTF-8，二进制文件通过复制/移动使用相同的提交保护。
 
-**v1.9.3 补充修复**：工作根保护同时识别配置别名和真实路径，并拒绝操作包含受保护根的祖先；移动失败时计入已经删除的源目录；策略探测参与父目录锁；目录操作失败保留之前子项的清理诊断；glob去重、累计限额并分批让出主线程，避免过滤条件绕过超时或阻塞心跳。
+**累计修复与优化**：拒绝非法 UTF-8、UTF-16 和 NUL 文本的破坏性编辑；修复分页边界、换行匹配、复制移动重叠、并发追加及部分失败状态；安全中转失败不再回退直写；锁和临时文件清理失败不会掩盖主操作结果；工作线程和扫描预算防止复杂表达式阻塞服务。依赖锁定与 overrides 用于复现已验证的依赖树。
+
+**升级行为变化**：显式 `writePolicy` 优先，其次是持久人工策略，再由 `auto` 观察文件状态。Windows 的 `auto` 缺少可用外部读取器时返回 `DISK_UNVERIFIED`，不会猜测后继续写入；需要新建受保护文件时明确指定 `preserve` 或配置人工 `protected`。更新后重启全部 MCP 实例，并用 `check_status` 确认运行版本为 `2.1.0`。
 
 ## 适用场景
 
@@ -50,40 +61,44 @@ AI Agent  --(MCP/stdio)-->  Node.js MCP Server(index.js)  --(lib/ 模块)-->  fs
 - `lib/regex.js` / `lib/regex-worker.js` 用户正则与字面量编辑在可终止 worker 中执行（单次计算默认最多 1 秒，并受请求总预算约束）
 - `lib/server.js` 注册全部 18 个 MCP 工具，统一 structuredContent 与超时/只读包装
 
-## 环境自适应（v1.7.0+）
+## 环境自适应
 
 ### 解决的问题
 
-加密软件对「写入是否透明加密」是**按目标文件扩展名**决定的，且每台电脑的策略不同：
+加密行为可能随目录、文件类型和进程变化。Node 能读到明文，并不表示 IDEA 或其他编辑器也能解密。新建探测样本的分类只描述进程观察，不能替代原文件的状态：
 
-| 扩展名分类 | 含义 | 直写后果 | 本工具策略 |
-|-----------|------|---------|-----------|
-| **safe** | 写入后磁盘是明文 | 正常 | 直接写（原始行为） |
-| **protected** | 写入后磁盘是密文，但 Node.js 白名单读回自动解密 | 本机正常 | 直接写（保持加密保护） |
-| **unsafe** | 写入后被加密，但该类型不在保护列表，**任何进程都无法解密** | 磁盘密文乱码，文件损坏 | 自动走 safeWrite |
+| 探测分类 | 实际观察 | 新建文件的 auto 策略 |
+|----------|----------|----------------------|
+| **safe** | Node 和外部读取视图均与探测载荷一致 | 允许先写暂存文件，暂存及最终路径仍须通过明文校验 |
+| **protected** | Node 读回正确，外部读取视图不同 | 不推断其他编辑器可解密，使用安全中转并验证明文 |
+| **unsafe** | Node 读回已经与探测载荷不同 | 使用安全中转并验证明文 |
+| **unknown** | 无法取得外部读取结果 | 不能宣称安全；有读取器时只允许通过严格明文校验后提交 |
+
+已有文件的状态不缓存、不按后缀共享：每次 `auto` 都比较该文件的 Node 指纹与外部进程指纹。两者一致时要求明文提交；两者不同时走受控写入，并检查外部视图没有意外变成预期明文。复制/移动覆盖已有目标时参考目标状态，新目标参考源文件状态；目录内逐文件执行。
 
 ### safeWrite 原理
 
-对 unsafe 扩展名目标，写入流程自动切换为：
+明文暂存写入出现内容不一致、目录探测不适合直接写入，或明确要求安全中转时，流程切换为：
 
 ```
-1. 写入 目标目录下 .mcp-safe-<uuid><安全扩展名> 的随机临时文件（安全类型 → 磁盘明文）
-2. 用探测到的可用外部进程（powershell/pwsh/cmd/robocopy/cscript）复制临时文件到目标路径
-   （外部进程不在白名单内，复制动作不触发透明加密 → 目标落盘为明文）
-3. 用独立读取器（PowerShell 流式 SHA256+size）校验目标文件磁盘指纹为明文
+1. 写入目标目录下 .mcp-safe-<uuid><候选扩展名> 的随机临时文件，并验证其内容
+2. 用可用外部进程（powershell/pwsh/cmd/robocopy/cscript）复制到 .mcp-stage-<uuid><目标扩展名>
+3. 用Node和外部读取器（PowerShell 流式 SHA256+size）验证暂存文件与预期载荷一致
 4. 清理临时文件
 5. 失败则遍历全部「安全扩展名 × 可用进程」组合重试；
-   v1.9.0 起全部失败直接报错（SAFE_WRITE_FAILED），原文件保持不变，不再回退直写
+   全部失败直接报错（SAFE_WRITE_FAILED），不再回退未经验证的写入
 ```
+
+暂存成功后仍需 rename 提交及最终路径校验，最终校验失败会回滚。外部进程是否会加密、是否会自动解密均不能仅凭进程名称判断；上述校验是进程可见字节对照，不是绕过驱动读取原始磁盘。
 
 ### 探测与缓存
 
-- **首次启动（或缓存失效）自动探测**：在系统临时目录用候选扩展名写入探测样本，通过「Node 读回对比 + 独立进程读磁盘指纹」分类；再探测可用的外部进程并做复制交叉验证
-- **目录级实时探测（v1.9.0）**：具体写入前按「目标目录 × 扩展名」在该目录内创建随机探测样本（`.mcp-probe-<uuid><ext>`，写完即删）实时分类，结果缓存在内存 scopes 中——加密策略按目录生效时结果也准确
-- **自动缓存位置**：`~/.mcp-encryption-profile.json`（结构 v3），按 machineId（hostname+username 哈希）绑定，**换电脑/换用户自动重新探测**；缓存有效期 30 天；v1/v2 旧缓存自动作废（v2 中的人工 protected 标注会一次性迁移到独立策略目录）
+- **首次需要自动策略（或缓存失效）时探测**：在系统临时目录用候选扩展名写入样本，通过 Node 与外部进程指纹对照分类，并探测可用复制进程
+- **目录级探测**：无原文件或复制源状态可参考的新建路径，按「目标目录 × 扩展名」创建随机样本（`.mcp-probe-<uuid><ext>`，写完即删），观察缓存在内存 scopes 中。已有文件优先逐文件观察，不受旧目录分类覆盖
+- **自动缓存位置**：`~/.mcp-encryption-profile.json`（结构 v3），按 machineId（hostname+username 哈希）绑定，换电脑/换用户重新探测；有效期 30 天。兼容有效的 v2/v3 缓存，丢弃旧 scopes；v2 人工 protected 一次性迁移到独立策略目录
 - **人工策略独立存储**：`~/.mcp-file-policies/` 每个扩展名一个文件，刷新探测、TTL 过期、服务重启都不会删除人工标注
 - **查看/刷新**：用 `encryption_profile` 工具查看当前探测结果与人工策略；加密策略变更后用 `refresh_profile` 强制重探（只刷新自动探测，不动人工策略）；`inspect_write_strategy` 可预览某个目标路径将采用的写入策略而不修改目标文件
-- **无外部进程可用时**（如进程被策略禁止 spawn）：普通写入仍以 Node 侧指纹校验内容一致；强制 `writePolicy=plaintext` 时会明确报 `DISK_UNVERIFIED` 而不会谎称已落盘明文
+- **无外部读取器时**：Windows 的 auto 返回 `DISK_UNVERIFIED`；非 Windows 且没有该后缀的加密观察时保留 Node 内容校验，返回 unknown 并告警。显式 plaintext 在所有平台都必须有可用外部读取器。配置过的读取器临时失败时不得降级为成功
 
 ### 写入策略（writePolicy）
 
@@ -91,21 +106,23 @@ write_file / edit_file / copy_path / move_path 均支持 `writePolicy` 参数：
 
 | 值 | 语义 |
 |----|------|
-| `auto`（默认） | 人工标注优先；否则按目标目录实时探测：safe 直写、protected 直写保持加密、unsafe 走 safeWrite |
-| `preserve` | 显式保持受控加密直写（等同人工标注 protected 的当次效果） |
-| `plaintext` | 强制磁盘明文：必须经 safeWrite 且由独立读取器验证完整磁盘指纹，验证失败则中止并保留原文件 |
+| `auto`（默认） | 人工标注优先；否则原明文要求明文终验，原受保护文件保留受控写入；新文件要求明文，不自动沿用探测样本的加密状态 |
+| `preserve` | 显式受控写入，经暂存替换并校验 Node 内容；不保证原来的明文状态，也不保证其他编辑器能解密 |
+| `plaintext` | 显式安全中转，必须验证暂存及最终路径的外部指纹与预期明文一致；失败中止或回滚 |
+
+返回的 `strategy.basis` 区分 `explicit`（本次显式策略）、`override`（人工标注）、`target`（原目标）、`source`（新复制目标的源）、`new_file`（全新文件）和 `unverified`。`originalState` 记录自动决策依据；`category` 描述观察结果，不是编辑器兼容性认证。`user_unsafe` 在显式 plaintext 下也会返回，不表示新增了永久标注。
 
 ### mark_extension 手动标注
 
-当自动分类不符合预期时手动干预（标注优先级高于一切自动分类，独立持久化，重启/刷新不丢失）：
+当需要固定某类文件的写入方式时手动标注（本次显式 writePolicy 优先，其次人工标注，再次自动状态判断；标注持久化，重启/刷新不丢失）：
 
 | 场景 | 调用 | 效果 |
 |------|------|------|
-| `.java` 需要保持 TSD 加密（受控文档） | `mark_extension(".java", "protected")` | auto 策略下直写保持加密，Notepad 打开正常 |
-| `.scss` 必须保持明文（自动误判） | `mark_extension(".scss", "unsafe")` | auto 策略下强制走 safeWrite 保持明文 |
+| `.java` 需要受控写入 | `mark_extension(".java", "protected")` | auto 采用 preserve；仍需确认实际使用的编辑器能正常读取 |
+| `.custom` 需要固定明文写入 | `mark_extension(".custom", "unsafe")` | auto 强制使用安全中转及明文校验 |
 | 恢复自动分类 | `mark_extension(".java", "clear")` | 写入墓碑清除标注，恢复实时探测 |
 
-## 写入保证（v1.9.0）
+## 写入保证
 
 所有文本修改（write_file / edit_file）与文件复制/移动都经过统一的可回滚提交流程：
 
@@ -114,13 +131,13 @@ write_file / edit_file / copy_path / move_path 均支持 `writePolicy` 参数：
   → 同目录随机独占暂存 .mcp-stage-<uuid><ext>（外部进程中转时经安全扩展名）
   → fsync 刷盘 → 再次比对改前指纹（防并发改动）
   → 原文件 rename 为 .mcp-backup-<uuid><ext> → 暂存 rename 到位
-  → 独立指纹终验（SHA256+size；有独立读取器时含磁盘原始字节）
+  → 指纹终验（SHA256+size；自动状态策略同时检查外部读取视图）
   → 成功删除备份；任一步失败自动回滚，回滚失败返回 recoveryPath（备份不得删除）
 ```
 
 - **完整载荷**：追加模式先在内存合成「原内容+新增」完整内容再走事务，纠正/重写不会丢原文与 BOM
 - **safeWrite 失败即中止**：不再回退直写破坏原文（SAFE_WRITE_FAILED，changed=false）
-- **跨实例锁**：使用同一 `MCP_PROFILE_DIR` 的实例经 `.mcp-file-locks/` 登记整组路径，同路径及祖先/后代相互排斥，无关路径可并行（等待 5 秒超时 FILE_BUSY）；`expectedHash` 可检测其他编辑器造成的版本变化（CONFLICT）。升级到 1.9.2 时应重启全部 MCP 实例，避免旧版进程继续使用不同的锁协议
+- **跨实例锁**：使用同一 `MCP_PROFILE_DIR` 的实例经 `.mcp-file-locks/` 登记整组路径，同路径及祖先/后代相互排斥，无关路径可并行（等待 5 秒超时 FILE_BUSY）；`expectedHash` 可检测其他编辑器造成的版本变化（CONFLICT）。升级时应重启全部 MCP 实例，避免旧进程继续执行旧的锁和写入策略
 - **清理状态**：提交或锁清理失败会附带 `cleanupErrors`；主操作已成功时保留成功结果和真实 `changed`，错误时保留原错误及 `recoveryPath`。不要因清理告警重复追加内容
 - **递归删除**：逐项执行，失败时返回 `changed`、`partial`（最多100项）、`removedCount`、`partialTruncated`、`failedPath`；受一万项和128层预算限制，不是整树事务
 - **断电/强杀残留**：两次 rename 之间的极端崩溃可能留下 `.mcp-backup-*` 与 `.mcp-stage-*`，先核对内容与时间再人工恢复，禁止直接批量清理
@@ -128,7 +145,8 @@ write_file / edit_file / copy_path / move_path 均支持 `writePolicy` 参数：
 - **移动失败的源变化**：`sourceRetained` 表示本次是否尚未删除任何源文件或源目录；`removedSourceCount`、`removedSourcePaths`（最多100项）、`removedSourcePathsTruncated` 报告已经删除的源项。失败仍保留已完成子项的 `cleanupErrors`
 - **策略探测互斥**：`inspect_write_strategy` 持有目标父目录锁，创建和清理探测样本完成后才允许该目录被复制、移动或删除
 - **glob总预算**：生产搜索与查找使用异步匹配，合并重复模式和分支；一次请求的展开后累计长度最多10万，编译和全部路径匹配共用5000万工作单元预算。约每16384工作单元让出事件循环，检查取消与截止时间；超过限额返回 `GLOB_LIMIT`，超时返回 `TIMEOUT`
-- **diskState 三态**：`plaintext`（独立进程验证磁盘明文）、`preserved`（保持加密直写）、`unknown`（内容已校验但无独立读取器证明磁盘状态——不能当作「已证明明文」）
+- **diskState 三态**：`plaintext`（Node 与外部视图均匹配预期明文）、`preserved`（Node 内容通过受控写入校验，不保证其他编辑器可解密）、`unknown`（仅内容校验，不能声称已验证明文）。自动保留原保护状态还返回 `protectionObserved:true`，表示外部视图仍不同，并非密钥或加密完整性认证
+- **校验边界**：如果外部读取器也被透明解密，两种视图一致仍不能证明原始磁盘未加密。上线前用真实驱动及目标编辑器验收；已经损坏或已经加密的异常文件不会因升级而自动修复
 
 ## 文件结构
 
@@ -139,10 +157,10 @@ mcp-read-file-server/
 ├── index.js          # MCP Server stdio 入口（含 shebang，可作可执行入口）
 ├── lib/              # 生产模块（encryption/files/text/patterns/regex/server）
 ├── scripts/          # 开发检查工具（check.js：语法+LF 检查）
-├── test/             # 仓库内回归/协议/适配测试（不随包发布）
-├── package.json      # 包配置（bin/files/依赖声明，可 npm publish）
+├── test/             # 仓库内回归/协议/适配测试
+├── package.json      # 包配置（bin/files/依赖声明）
 ├── .gitignore        # Git 忽略规则
-└── node_modules/     # 依赖（@modelcontextprotocol/sdk、zod，不随包发布）
+└── node_modules/     # 依赖（@modelcontextprotocol/sdk、zod）
 ```
 
 ### 子目录说明
@@ -391,23 +409,23 @@ find_files 之外的文件名查找也优先用 MCP 工具。
 - 建目录/查信息   → create_directory / file_info
 
 ## 使用规则
-1. 会话开始先调 check_status 确认白名单解密正常；环境不明时调
+1. 会话开始先调 check_status 确认服务版本与运行状态；它不自动证明解密正常。环境不明时调
    encryption_profile 查看本机扩展名分类与人工策略；
    写入前可用 inspect_write_strategy 预览目标路径的写入策略。
-2. 写任何扩展名的文件都不用关心加密细节：write_file/edit_file/copy_path/
-   move_path 默认 writePolicy=auto，按目标目录实时探测并自动选择直写或
-   safeWrite；需要保持加密用 writePolicy=preserve，需要强制磁盘明文用
-   writePolicy=plaintext（失败会中止并保留原文件，不会回退直写）。
+2. write_file/edit_file/copy_path/move_path 默认 writePolicy=auto：
+   原明文文件保持明文校验，原受保护文件保持受控写入，新文件默认要求明文。
+   明确需要受控写入用 preserve，明确需要明文用 plaintext。
+   preserved 不证明 IDEA 等其他程序能解密；Windows 缺少外部读取器时 auto 拒绝写入。
 3. 需要长期保持加密/明文的扩展名：用 mark_extension(".java", "protected")
-   或 mark_extension(".scss", "unsafe") 标注一次永久生效（独立存储，
+   或 mark_extension(".custom", "unsafe") 标注一次永久生效（独立存储，
    重启与刷新探测不丢失）；mark_extension(".ext", "clear") 恢复自动。
 4. edit_file 前必须先 read_file 拿原文，oldString 从原文原样复制
    （含空格与缩进；CRLF/LF 换行差异会自动兼容，无需手工处理）；
    重要修改先 dryRun=true 预览；可用 expectedHash 防止覆盖他人改动。
 5. 路径一律使用绝对路径。
 6. 写工具返回 isError 时先看 structuredContent 的 code：
-   SAFE_WRITE_FAILED/DISK_MISMATCH 说明明文落盘失败（原文件未动），
-   先调 refresh_profile 重新探测再重试；出现 recoveryPath 说明回滚
+   SAFE_WRITE_FAILED/DISK_MISMATCH 表示写入校验失败；检查 changed 和恢复信息，
+   不要改用普通 shell 覆盖。出现 recoveryPath 说明回滚
    也失败，保留该备份并报告用户，禁止盲目重试或删除备份。
 7. edit_file 匹配失败时，按返回的「可能相关的行」诊断修正 oldString，
    不要盲目重试。
@@ -499,15 +517,13 @@ npm test         # 仓库内回归/协议/适配测试（Node 内置 test runner
 npm audit --omit=dev
 ```
 
-测试位于 `test/`（regression/protocol/adapters 三个套件，模拟磁盘错误与真实 stdio 协议分离，不触碰真实 profile）；CI 覆盖 Windows/Linux × Node 20/22/24。运行依赖：MCP SDK 1.30.0、Zod 4.4.3（间接依赖 fast-uri/qs 通过 overrides 限定修复版本）。
+测试位于 `test/`，包含基础回归、真实 stdio、Windows 适配器、边界/并发修复以及 `write-policy.test.js` 通用写入状态回归；模拟读取视图与真实驱动验收分开，不触碰真实 profile。可通过 `MCP_TEST_ROOT` 指定独立测试目录。CI 配置覆盖 Windows/Linux × Node 20/22/24。运行依赖：MCP SDK 1.30.0、Zod 4.4.3，间接依赖 fast-uri/qs/Hono 通过 overrides 限定修复版本。
 
 ## 故障排查
 
 ### 读取到的仍是密文
 
-说明 Node.js 未被加密软件列为白名单。解决方法：
-- 联系加密软件管理员，将 `node.exe` 加入白名单
-- 确认加密软件的受信任进程列表中包含 Node.js
+可能是 Node.js 未被授权解密，也可能是该文件类型、路径或原文件状态不满足解密条件。先保留原文件，确认运行入口与实际 `node.exe` 路径，再核对加密软件配置；不能只凭“程序在白名单”就认定所有文件均可解密。
 
 ### MCP Server 无法启动
 
@@ -520,17 +536,22 @@ cd mcp-read-file-server && npm ci
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}' | node index.js
 ```
 
-### 写入 .scss/.css 等文件后显示乱码（密文）
+### MCP 返回成功，但编辑器打开显示密文
 
-该扩展名在本机属于 unsafe 类型（加密但不自动解密）。v1.7.0+ 会自动走 safeWrite 规避；若仍出现乱码：
+Node 可读不等于其他编辑器可读，不能只凭锁图标判断状态。当前版本对所有文件类型统一处理原明文状态。若仍出现异常：
 
-1. 调 `refresh_profile` 强制重新探测（策略可能变更或缓存过期）
-2. 调 `encryption_profile` 确认该扩展名分类与可用外部进程；或对该扩展名直接 `mark_extension(".scss", "unsafe")` 强制明文
-3. 若显示「可用外部进程: （无）」，说明 MCP Server 进程被策略禁止 spawn 子进程，需联系管理员放行 powershell/cmd，或接受直写加密后由白名单应用打开
+1. 用 `check_status` 确认实际服务为 2.1.0，保留异常文件和当次完整响应，不直接覆盖修复。
+2. 查看 `strategy.basis/originalState`、`diskState/diskVerified` 和 warnings，确认是否有显式 preserve 或人工 protected 覆盖自动决策。
+3. 使用独立副本验证所需策略，并检查外部读取器是否同样被透明解密。已经异常的受保护文件不会被 auto 自动解密；需要恢复时先核对原始备份。
 
 ### 写工具返回 SAFE_WRITE_FAILED / DISK_MISMATCH
 
-v1.9.0 起 safeWrite 失败**不再回退直写**（保护原文件，返回 `changed:false`）。说明所有「安全扩展名 × 外部进程」组合都验证失败（常见原因：外部进程对目标目录无写权限，或独立读取器验证磁盘指纹不一致）。处理：调 `refresh_profile` 重探；检查目标目录权限；确认 powershell/cmd 可被执行；换目录重试。
+safeWrite 全部组合失败返回 `SAFE_WRITE_FAILED`；最终路径校验不一致返回 `DISK_MISMATCH` 并尝试回滚。不回退未经验证的写入，是否恢复成功以 `changed/recoveryPath/rollbackError` 为准。检查目标目录权限、外部进程可用性和实际读取视图；环境已发生变化时再考虑 `refresh_profile` 重探。
+
+### 写工具返回 DISK_UNVERIFIED / PROTECTION_MISMATCH
+
+- `DISK_UNVERIFIED`：无法取得所需外部读取视图。Windows auto 不能据此猜测原文件状态；检查读取器可用性，不要为了通过测试盲目切到 preserve。
+- `PROTECTION_MISMATCH`：自动保留受保护文件时，暂存或最终目标的外部视图变成了预期明文；为避免静默改变保护状态而中止或回滚。确实需要明文时应明确指定 plaintext，并用独立样本验证。
 
 ### 写工具返回 FILE_BUSY / CONFLICT
 
