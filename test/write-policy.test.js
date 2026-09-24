@@ -39,6 +39,9 @@ async function encryptedEnvironment(t, settings = {}) {
       const name = path.basename(file);
       if (settings.encryptDirect !== false && /^\.mcp-(stage|probe)-/.test(name) && !copied.has(file)) protectedFiles.add(key);
       const actual = await fingerprint(file, context);
+      // 安全候选文件代表“应当保持明文”的临时文件：即使它复用了刚被删除暂存文件的inode，
+      // 也必须按明文读取；否则回退循环里每个候选都会被误判为已受保护密文，整体报SAFE_WRITE_FAILED。
+      if (/^\.mcp-safe-/.test(name)) return actual;
       return protectedFiles.has(key) ? payloadFingerprint(Buffer.concat([Buffer.from('%TSD-Header-###%'), await fs.readFile(file)])) : actual;
     },
     /** 外部复制不触发模拟加密；可注入失败验证原目标和源文件的保留。 */
