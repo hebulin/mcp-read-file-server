@@ -9,8 +9,11 @@ const { fingerprint } = require('../lib/text');
 
 /** 初始化隔离测试目录和可注入复制器，不接触用户真实profile。 */
 async function fixture(t, settings = {}) {
-  const base = path.resolve(process.env.MCP_TEST_ROOT || path.join(os.tmpdir(), 'mcp-read-file-tests'));
-  await fs.mkdir(base, { recursive: true });
+  const requested = path.resolve(process.env.MCP_TEST_ROOT || path.join(os.tmpdir(), 'mcp-read-file-tests'));
+  await fs.mkdir(requested, { recursive: true });
+  // 统一为真实长路径：Windows 的TEMP可能是8.3短名(RUNNER~1)或链接路径，
+  // 而生产代码内部用realpath，字符串比较的故障注入与断言会因此全部失效。
+  const base = await fs.realpath(requested);
   const root = await fs.mkdtemp(path.join(base, 'case-'));
   const stateDir = path.join(root, 'state');
   await fs.mkdir(stateDir);
