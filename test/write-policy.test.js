@@ -291,3 +291,85 @@ test('无读取器且缓存有加密观察时所有平台均拒绝auto，不静�
   failure(await f.call('write_file', { path: file, content: 'NEW' }), 'DISK_UNVERIFIED');
   assert.equal(await fs.readFile(file, 'utf8'), 'old');
 });
+
+test('2.1.2 新建文件安全中转保留BOM和CRLF，任意后缀仍必须明文', async t => {
+  const f = await encryptedEnvironment(t);
+  const content = '\uFEFF中文😀\r\nNEW\r\n';
+  for (const name of ['new-crlf.scss', 'new-crlf.unknown-212', 'NOEXT-CRLF']) {
+    const file = path.join(f.root, name);
+    const data = success(await f.call('write_file', { path: file, content, writePolicy: 'auto' }));
+    assert.deepEqual(await fs.readFile(file), Buffer.from(content));
+    assert.equal(data.hash, payloadFingerprint(content).hash);
+    assert.equal(data.strategy.basis, 'new_file');
+    assert.equal(data.diskState, 'plaintext');
+    assert.equal(data.via.process, 'powershell');
+    assert.equal(await f.isProtected(file), false);
+  }
+});
+
+test('2.1.2 无旧行尾的同后缀P/E文件保留输入CRLF，同时保持各自保护状态', async t => {
+  const f = await encryptedEnvironment(t);
+  for (const protectedBefore of [false, true]) {
+    const file = await f.sample((protectedBefore ? 'E' : 'P') + '.same-212', '\uFEFFOLD');
+    if (protectedBefore) await f.protect(file);
+    const data = success(await f.call('write_file', { path: file, content: 'NEW\r\nLINE\r\n', writePolicy: 'auto' }));
+    assert.deepEqual(await fs.readFile(file), Buffer.from('\uFEFFNEW\r\nLINE\r\n'));
+    assert.equal(data.strategy.originalState, protectedBefore ? 'protected' : 'plaintext');
+    assert.equal(data.diskState, protectedBefore ? 'preserved' : 'plaintext');
+    assert.equal(await f.isProtected(file), protectedBefore);
+  }
+});
+
+test('现场补测C02：默认新建明文后再次auto编辑，同后缀保护分类不能把明文改成密文', async t => {
+  const f = await encryptedEnvironment(t);
+  for (const name of ['new-then-edit.scss', 'new-then-edit.unlisted']) {
+    const file = path.join(f.root, name);
+    const original = '\uFEFFOLD\r\n中文😀\r\n';
+    success(await f.call('write_file', { path: file, content: original, overwrite: false, writePolicy: 'auto' }));
+    assert.equal(await f.isProtected(file), false);
+    const result = success(await f.call('edit_file', { path: file, oldString: 'OLD', newString: 'NEW', expectedHash: payloadFingerprint(original).hash, expectedMatches: 1, writePolicy: 'auto' }));
+    assert.equal(result.strategy.originalState, 'plaintext');
+    assert.equal(result.diskState, 'plaintext');
+    assert.equal(await f.isProtected(file), false);
+    assert.deepEqual(await fs.readFile(file), Buffer.from('\uFEFFNEW\r\n中文😀\r\n'));
+  }
+});
+
+for (const tool of ['copy_path', 'move_path']) {
+  test('现场补测C09：' + tool + '逐文件验证混合P/E、已有目标与新后缀的完整hash和保护状态', async t => {
+    const f = await encryptedEnvironment(t);
+    const source = path.join(f.root, 'source');
+    const container = path.join(f.root, 'container');
+    const destination = path.join(container, 'source');
+    const manifest = [
+      { name: 'plain.same', content: 'SOURCE-P\r\n', sourceProtected: false, targetProtected: true, existed: true },
+      { name: 'protected.same', content: 'SOURCE-E\r\n', sourceProtected: true, targetProtected: false, existed: true },
+      { name: 'new-plain.unlisted', content: 'NEW-P\r\n', sourceProtected: false, targetProtected: false, existed: false },
+      { name: '中文 文件.unlisted', content: '\uFEFF新密文😀\r\n', sourceProtected: true, targetProtected: true, existed: false },
+    ];
+    for (const item of manifest) {
+      const src = await f.sample('source/' + item.name, item.content);
+      if (item.sourceProtected) await f.protect(src);
+      if (item.existed) {
+        const dst = await f.sample('container/source/' + item.name, 'TARGET-OLD');
+        if (item.targetProtected) await f.protect(dst);
+      }
+    }
+    await fs.mkdir(path.join(source, 'empty'), { recursive: true });
+    const result = success(await f.call(tool, { source, destination: container, overwrite: true, writePolicy: 'auto' }));
+    assert.equal(result.files, manifest.length);
+    for (const item of manifest) {
+      const dst = path.join(destination, item.name);
+      assert.deepEqual(await fs.readFile(dst), Buffer.from(item.content));
+      assert.equal((await fingerprint(dst)).hash, payloadFingerprint(item.content).hash);
+      assert.equal(await f.isProtected(dst), item.targetProtected, item.name);
+      const src = path.join(source, item.name);
+      if (tool === 'copy_path') {
+        assert.deepEqual(await fs.readFile(src), Buffer.from(item.content));
+        assert.equal(await f.isProtected(src), item.sourceProtected);
+      } else await assert.rejects(fs.access(src), { code: 'ENOENT' });
+    }
+    assert.ok((await fs.stat(path.join(destination, 'empty'))).isDirectory());
+    if (tool === 'move_path') await assert.rejects(fs.access(source), { code: 'ENOENT' });
+  });
+}
