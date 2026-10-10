@@ -25,6 +25,21 @@ async function bounded(promise, ms = 5000) {
 function success(response) { assert.equal(response.structuredContent.ok, true, JSON.stringify(response)); return response.structuredContent.data; }
 /** 断言错误码后返回状态字段。 */
 function failure(response, code) { assert.equal(response.structuredContent.ok, false); assert.equal(response.structuredContent.code, code); return response.structuredContent.data; }
+/** 让目录枚举按名称排序：readdir顺序在Linux上是哈希序、在NTFS上是名字序，断言不能依赖遍历次序。 */
+function sortDirectoryEntries() {
+  const realOpendir = fs.opendir;
+  fs.opendir = async dir => {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    entries.sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0));
+    let index = 0;
+    return {
+      [Symbol.asyncIterator]() { return this; },
+      async next() { return index < entries.length ? { value: entries[index++], done: false } : { value: undefined, done: true }; },
+      async return() { return { value: undefined, done: true }; },
+    };
+  };
+  return () => { fs.opendir = realOpendir; };
+}
 
 test('N1 目录移动与另一个实例写源子文件互斥，已确认的新内容不会丢失', async t => {
   const f = await fixture(t);
@@ -166,10 +181,11 @@ test('N3 递归删除中途失败返回已删除项、准确计数与失败路�
   const a = await f.sample('tree/a.txt', 'A');
   const b = await f.sample('tree/b.txt', 'B');
   const realUnlink = fs.unlink;
+  const restoreOpendir = sortDirectoryEntries();
   fs.unlink = async file => { if (file === b) throw fault('EBUSY', '模拟占用'); return realUnlink(file); };
   let response;
   try { response = await f.call('remove_path', { path: path.dirname(a) }); }
-  finally { fs.unlink = realUnlink; }
+  finally { fs.unlink = realUnlink; restoreOpendir(); }
   const data = failure(response, 'EBUSY');
   assert.equal(data.changed, true);
   assert.deepEqual(data.partial, [a]);
@@ -186,10 +202,11 @@ test('N3 删除部分完成后取消仍保留准确状态', async t => {
   const b = await f.sample('tree/b.txt', 'B');
   const controller = new AbortController();
   const realUnlink = fs.unlink;
+  const restoreOpendir = sortDirectoryEntries();
   fs.unlink = async file => { await realUnlink(file); if (file === a) controller.abort(); };
   let response;
   try { response = await f.handlers.remove_path({ path: path.dirname(a) }, { signal: controller.signal }); }
-  finally { fs.unlink = realUnlink; }
+  finally { fs.unlink = realUnlink; restoreOpendir(); }
   const data = failure(response, 'CANCELLED');
   assert.equal(data.changed, true);
   assert.equal(data.removedCount, 1);
@@ -209,9 +226,10 @@ test('N3 Windows真实独占句柄造成部分删除，返回状态与磁盘一�
   child.stdout.on('data', chunk => { output += chunk; if (output.includes('READY')) ready.resolve(); });
   child.on('error', error => ready.resolve(error));
   child.on('close', () => closed.resolve());
+  const restoreOpendir = sortDirectoryEntries();
   let response;
   try { await bounded(ready.promise); response = await f.call('remove_path', { path: path.dirname(a), recursive: true }); }
-  finally { child.stdin.end('\n'); try { await bounded(closed.promise); } catch { child.kill(); await bounded(closed.promise); } }
+  finally { restoreOpendir(); child.stdin.end('\n'); try { await bounded(closed.promise); } catch { child.kill(); await bounded(closed.promise); } }
   const data = failure(response, 'EBUSY');
   assert.equal(data.changed, true);
   assert.equal(data.removedCount, 1);
