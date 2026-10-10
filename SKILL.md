@@ -5,13 +5,14 @@ description: 在Node.js为加密软件白名单进程的环境中，使用文件
 
 # 加密环境文件操作
 
-使用前确认Node.js受信任，并配置read-file-server。版本2.1.0提供18个工具，最低Node20。
+使用前确认Node.js受信任，并配置read-file-server。版本2.1.3提供18个工具，最低Node20。
 
 ## 工具选择
 
 - 读取：read_file、read_files；大文件使用read_file_partial和nextOffset/nextLine。
 - 编辑：edit_file，多个修改用edits数组；先dryRun预览，需要时指定expectedHash和expectedMatches。
 - 写入/追加：write_file；不要自行绕过错误改用普通shell覆盖。
+- 行尾：write_file的eol=auto沿用已有文件的行尾；新文件、空文件或原文无换行时保留本次输入的行尾（含混合换行）。显式lf/crlf只规范化本次载荷，追加不改动原文。
 - 搜索：search_files，普通文本优先mode=literal；include优先传数组。隐藏项用showHidden，构建目录用useDefaultIgnore=false。
 - 文件名/目录：find_files、list_directory；信息与指纹：file_info。
 - 复制/移动/删除：copy_path、move_path、remove_path；删除可先dryRun。

@@ -4,11 +4,11 @@
 
 加密环境文件操作工具。当 Node.js 是加密软件白名单进程时，通过 fs 模块自动解密读写文件明文，替代 AI Agent 内置文件工具，解决加密环境下读到密文的问题。适用于任何支持 MCP 协议的 AI Agent。
 
-## 最新版本：2.1.0（相对 1.0）
+## 最新版本：2.1.3（相对 1.0）
 
 本节以仓库 `v1.0` 标签（包版本 `1.0.0`）为基线，汇总当前版本的变化，不再逐条保留中间版本的更新说明。
 
-| 方面 | 1.0 | 2.1.0 |
+| 方面 | 1.0 | 2.1.3 |
 |------|-----|-------|
 | 文件写入 | 由 Node 直接读改写，依赖本机透明加密行为 | 统一暂存、备份、提交及终验；失败回滚，恢复失败保留 `recoveryPath` |
 | 加密策略 | 没有按原文件状态选择写入策略 | `auto` 比较原文件的 Node 与外部读取视图：原明文继续验证明文，原受保护文件保留受控写入；新建文件不凭 Node 可读就自动加密 |
@@ -23,7 +23,7 @@
 
 **累计修复与优化**：拒绝非法 UTF-8、UTF-16 和 NUL 文本的破坏性编辑；修复分页边界、换行匹配、复制移动重叠、并发追加及部分失败状态；安全中转失败不再回退直写；锁和临时文件清理失败不会掩盖主操作结果；工作线程和扫描预算防止复杂表达式阻塞服务。依赖锁定与 overrides 用于复现已验证的依赖树。
 
-**升级行为变化**：显式 `writePolicy` 优先，其次是持久人工策略，再由 `auto` 观察文件状态。Windows 的 `auto` 缺少可用外部读取器时返回 `DISK_UNVERIFIED`，不会猜测后继续写入；需要新建受保护文件时明确指定 `preserve` 或配置人工 `protected`。更新后重启全部 MCP 实例，并用 `check_status` 确认运行版本为 `2.1.0`。
+**升级行为变化**：显式 `writePolicy` 优先，其次是持久人工策略，再由 `auto` 观察文件状态。Windows 的 `auto` 缺少可用外部读取器时返回 `DISK_UNVERIFIED`，不会猜测后继续写入；需要新建受保护文件时明确指定 `preserve` 或配置人工 `protected`。更新后重启全部 MCP 实例，并用 `check_status` 确认运行版本为 `2.1.3`。
 
 ## 适用场景
 
@@ -136,9 +136,10 @@ write_file / edit_file / copy_path / move_path 均支持 `writePolicy` 参数：
 ```
 
 - **完整载荷**：追加模式先在内存合成「原内容+新增」完整内容再走事务，纠正/重写不会丢原文与 BOM
-- **safeWrite 失败即中止**：不再回退直写破坏原文（SAFE_WRITE_FAILED，changed=false）
+- **写入行尾**：write_file的eol=auto沿用原文件的主导行尾；新文件、空文件或原文无换行时，保留输入行尾（含混合换行）。显式lf/crlf只转换本次载荷；追加不会重写原有内容。此规则与加密状态策略独立
+- **safeWrite 失败即中止**：不再回退直写破坏原文；`SAFE_WRITE_FAILED` 的 `reasons` 保留候选失败原因。如果本次已创建父目录，失败仍返回 `changed=true` 和 `createdDirectories`；这些目录会保留，避免误删并发加入的内容
 - **跨实例锁**：使用同一 `MCP_PROFILE_DIR` 的实例经 `.mcp-file-locks/` 登记整组路径，同路径及祖先/后代相互排斥，无关路径可并行（等待 5 秒超时 FILE_BUSY）；`expectedHash` 可检测其他编辑器造成的版本变化（CONFLICT）。升级时应重启全部 MCP 实例，避免旧进程继续执行旧的锁和写入策略
-- **清理状态**：提交或锁清理失败会附带 `cleanupErrors`；主操作已成功时保留成功结果和真实 `changed`，错误时保留原错误及 `recoveryPath`。不要因清理告警重复追加内容
+- **清理状态**：暂存、锁、探测、外部复制及配置保存的辅助文件清理失败会附带 `cleanupErrors`；主操作已成功时保留成功结果和真实 `changed`，错误时保留原错误及 `recoveryPath`。不要因清理告警重复追加内容
 - **递归删除**：逐项执行，失败时返回 `changed`、`partial`（最多100项）、`removedCount`、`partialTruncated`、`failedPath`；受一万项和128层预算限制，不是整树事务
 - **断电/强杀残留**：两次 rename 之间的极端崩溃可能留下 `.mcp-backup-*` 与 `.mcp-stage-*`，先核对内容与时间再人工恢复，禁止直接批量清理
 - **复制/移动目录**：逐文件执行相同策略；移动先复制并二次比对指纹后再删除已验证的源文件；失败返回 `partial` 与 `sourceRetained`，不静默回退；符号链接明确拒绝；源和最终目标存在任一方向的祖先关系时拒绝，相同路径保持不变。回滚失败时 `changed=true`，`partial` 包含当前失败目标，原备份通过 `recoveryPath` 返回
@@ -361,7 +362,7 @@ Windows 下文件多为 CRLF 换行，而 AI Agent 生成的多行 `oldString` �
 - **匹配阶段**：先按字节原样精确匹配；未命中时自动将文件与 `oldString` 的换行符统一归一（`\r\n` / `\r` / `\n` 均视为换行）后再匹配，两种风格任意组合均可命中
 - **写入阶段**：`newString` 的行尾会自动转换为文件本身的主导换行风格，不会把 CRLF 文件改写为 LF 混行
 - **BOM 自动处理**：UTF-8 BOM 读取时自动剥离、写回时自动补回，`oldString` 无需关心 BOM
-- **正则模式默认多行**：`useRegex=true` 时自动附加 `m` 标志，`^xxx` / `xxx$` 按行锚定；正则在独立 worker 中执行（默认 1 秒预算），超时/取消不影响服务继续响应
+- **正则模式默认多行**：`useRegex=true` 时自动附加 `m` 标志，`^xxx` / `xxx$` 按行锚定；正则在独立 worker 中执行（默认 1 秒预算，包含排队时间）。替换结果在构造时检查16MB预算；取消或超时仅结束对应请求，其他排队请求继续处理；匹配数量不符时返回实际 `matched`
 - **批量原子编辑（edits 数组）**：一次调用完成多处修改（1–200 条），按序应用；**任一条目失败则整体不写盘**，不会产生「半改状态」。条目按文件现状顺序构造（前面条目的结果参与后续条目匹配）
 - **dryRun 预览**：`dryRun=true` 返回 matched/replaced/原文与提议 hash 及差异片段，不写盘
 - **expectedMatches 计数保护**：声明期望替换处数，实际不符即失败（MATCH_COUNT_MISMATCH）不写盘，防止误替换
@@ -376,8 +377,8 @@ Windows 下文件多为 CRLF 换行，而 AI Agent 生成的多行 `oldString` �
 - **大文件截断**：`read_file` / `read_files` 单文件超过 40 万字符自动截断，提示改用 `read_file_partial` 分页读取，避免撑爆上下文
 - **二进制/超大文件跳过**：`search_files` 只预读首块判定二进制后即跳过，超过 5MB 的文件也跳过，并在结果 skipped 中说明数量
 - **隐藏文件默认跳过**：`search_files` / `find_files` 默认跳过 `.` 开头的文件与目录（避免把 `.env` 等敏感内容灌入上下文），忽略目录还包含 `node_modules`、`.git`、`target`、`build`、`dist`、`vendor` 等（可用 `showHidden`/`useDefaultIgnore` 控制）；`list_directory` 可用 `showHidden=true` 显示
-- **glob 支持 `{a,b}` 花括号**：`find_files` / `search_files` 的 include 支持 `src/**/*.{ts,tsx}` 这类 Agent 高频写法；不含路径分隔符的 include 按文件名匹配，含 `/` 的按相对路径匹配
-- **主要预算**：字符页 40 万；文本整文件编辑/覆盖/追加 16MB；读取页最多扫描 64MB；搜索单文件 5MB、总输出 40 万字符、最多 2000 条；遍历最多 10 万项/128 层；目录复制/移动最多 1 万项；工具超时 `timeoutMs` 默认 15000（100–60000）
+- **glob 支持 `{a,b}` 花括号**：`find_files` / `search_files` 的 include 支持 `src/**/*.{ts,tsx}`；支持空分支，例如 `{,src/}*.js` 同时匹配根目录和 src 目录；不含路径分隔符的 include 按文件名匹配，含 `/` 的按相对路径匹配
+- **主要预算**：字符页 40 万；文本整文件编辑/覆盖/追加 16MB；读取页最多扫描 64MB；搜索单文件 5MB、总输出 40 万字符、最多 2000 条；literal 搜索输入最多4096字符，内部转义不挤占该预算；遍历最多 10 万项/128 层；目录复制/移动最多 1 万项（含源根、文件及已有/新建目录）、128 层；工具超时 `timeoutMs` 默认 15000（100–60000）
 
 ## 使用
 
@@ -517,7 +518,7 @@ npm test         # 仓库内回归/协议/适配测试（Node 内置 test runner
 npm audit --omit=dev
 ```
 
-测试位于 `test/`，包含基础回归、真实 stdio、Windows 适配器、边界/并发修复以及 `write-policy.test.js` 通用写入状态回归；模拟读取视图与真实驱动验收分开，不触碰真实 profile。可通过 `MCP_TEST_ROOT` 指定独立测试目录。CI 配置覆盖 Windows/Linux × Node 20/22/24。运行依赖：MCP SDK 1.30.0、Zod 4.4.3，间接依赖 fast-uri/qs/Hono 通过 overrides 限定修复版本。
+测试位于 `test/`，包含基础回归、真实 stdio、Windows 适配器、边界/并发修复、通用写入状态回归和异常清理/正则预算专项；模拟读取视图与真实驱动验收分开，不触碰真实 profile。可通过 `MCP_TEST_ROOT` 指定独立测试目录。CI 配置覆盖 Windows/Linux × Node 20/22/24。运行依赖：MCP SDK 1.31.0、Zod 4.4.3，间接依赖 fast-uri/qs/Hono/ip-address/proxy-addr 通过 overrides 限定修复版本。
 
 ## 故障排查
 
@@ -540,7 +541,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 
 Node 可读不等于其他编辑器可读，不能只凭锁图标判断状态。当前版本对所有文件类型统一处理原明文状态。若仍出现异常：
 
-1. 用 `check_status` 确认实际服务为 2.1.0，保留异常文件和当次完整响应，不直接覆盖修复。
+1. 用 `check_status` 确认实际服务为 2.1.3，保留异常文件和当次完整响应，不直接覆盖修复。
 2. 查看 `strategy.basis/originalState`、`diskState/diskVerified` 和 warnings，确认是否有显式 preserve 或人工 protected 覆盖自动决策。
 3. 使用独立副本验证所需策略，并检查外部读取器是否同样被透明解密。已经异常的受保护文件不会被 auto 自动解密；需要恢复时先核对原始备份。
 
