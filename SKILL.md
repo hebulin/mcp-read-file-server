@@ -5,7 +5,7 @@ description: 在Node.js为加密软件白名单进程的环境中，使用文件
 
 # 加密环境文件操作
 
-使用前确认Node.js受信任，并配置read-file-server。版本2.1.3提供18个工具，最低Node20。
+使用前确认Node.js受信任，并配置read-file-server。版本2.1.4提供18个工具，最低Node20。
 
 ## 工具选择
 
@@ -22,7 +22,7 @@ description: 在Node.js为加密软件白名单进程的环境中，使用文件
 
 1. 优先读取structuredContent的ok、code、changed、data和warnings，不能只看人类文本。
 2. isError=true时可能存在目录操作部分目标；查看changed/partial/sourceRetained。递归删除还需查看removedCount/partialTruncated/failedPath。单文件回滚失败时查看recoveryPath并保留备份。cleanupErrors只是清理诊断，成功修改后不得因清理告警重复追加。
-3. contentVerified表示Node可见内容一致；diskVerified表示外部进程可见字节也与预期载荷一致，不是绕过透明解密读取原始磁盘。preserved不保证IDEA等其他程序能解密，unknown不能声称已验证明文。
+3. contentVerified表示Node可见内容一致；diskVerified表示外部进程可见字节也与预期载荷一致，不是绕过透明解密读取原始磁盘。preserved不保证其他程序能解密，unknown不能声称已验证明文。verificationScope=node及protectionObserved=false明确表示没有观察外部保护状态；自动保留保护状态返回node-and-external-state。
 4. check_status基础调用不探测环境。文件可读取也不能直接推断解密正常，可信expectedHash匹配才提供明确内容对照。
 5. 文本工具只支持有效UTF8；UTF16、GBK、非法字节或NUL被拒绝时，必须先明确转换编码，不能强制按UTF8写回。
 
@@ -45,5 +45,9 @@ edits与oldString/newString/useRegex等单次字段互斥；批量ignoreCase可�
 ## 预算与恢复
 
 单页40万字符、完整文本修改16MB、搜索单文件5MB。字符offset使用UTF16单元，必须沿用nextOffset以免切开代理对。行分页不保证提前给出总行数。复制/移动目录逐文件验证，但不是跨文件事务；出现失败时根据partial处理。复制/移动遇到符号链接会明确拒绝，不自动跟随。
+
+共享环境探测最多60秒，请求TIMEOUT且probeStatus=running时探测仍继续，稍后重试复用缓存；取消不会继续该请求的目标写入。探测失败冷却5秒，retryAfterMs说明剩余时间；refresh_profile可绕过冷却。MCP_PROCESS_TIMEOUT_MS控制外部进程预算（默认5000，1–60000），慢机可配置30000并重启，查看readerDiagnostics中的耗时/预算。Windows无读取器结果只缓存30秒。plaintext/unsafe仍要求外部读取器，Linux/macOS内置实现暂不支持，可用mark_extension(clear)撤销人工unsafe，不能擅自降级直写。
+
+终验通过后的备份删除失败只产生cleanupErrors，新内容已经提交，不要重复追加。MCP_DISABLE_DELETE仅禁remove_path（含dryRun），不禁move_path删源；需要禁止全部修改应使用MCP_READ_ONLY。
 
 不要删除.mcp-backup-*、recoveryPath或正在运行进程的锁。进程异常退出后，先比对目标与备份，再恢复；不能承诺任意断电后自动恢复。测试必须使用独立MCP_PROFILE_DIR和MCP_TEST_ROOT，避免覆盖真实人工策略。开发验收执行npm run check、npm test、npm audit，真实TSD环境另用专门样本验证。
