@@ -1,4 +1,4 @@
-/** 2.1.4事务和环境探测回归；真实只读属性与确定性故障注入分开验证。 */
+/** 事务、探测及2.1.5精确文件身份回归；真实属性与确定性故障注入分开验证。 */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
@@ -94,7 +94,8 @@ for (const policy of ['auto', 'preserve', 'plaintext']) {
     assert.equal(await fs.readFile(source, 'utf8'), 'COPY');
     assert.equal((await fs.stat(destination)).mode & 0o200, 0);
     const writable = await f.sample('writable.txt', 'OLD');
-    success(await f.call('copy_path', { source, destination: writable, writePolicy: policy }));
+    const overwritten = success(await f.call('copy_path', { source, destination: writable, writePolicy: policy }));
+    assert.equal(overwritten.changed, true, '不同内容的目标必须真正覆盖，不能误报同一文件');
     assert.equal(await fs.readFile(writable, 'utf8'), 'COPY');
     assert.notEqual((await fs.stat(writable)).mode & 0o200, 0);
   });
@@ -112,6 +113,86 @@ test('T4 服务级单进程预算传到读取和安全中转并显示在profile'
   assert.ok(budgets.length >= 3);
   assert.ok(budgets.every(value => value === 30000));
   assert.equal(success(await f.call('encryption_profile', {})).processTimeoutMs, 30000);
+});
+
+/** 模拟两个不同64位身份在Number中舍入碰撞，保留真实文件内容与stat其他元数据。 */
+function collideNumericIdentity(source, destination, field = 'ino') {
+  const lstat = fs.lstat;
+  const first = 2n ** 56n;
+  const second = first + 1n;
+  assert.notEqual(first, second);
+  assert.equal(Number(first), Number(second));
+  fs.lstat = async (file, options) => {
+    const stat = await lstat(file, options);
+    if (file === source || file === destination) {
+      const identity = file === source ? first : second;
+      const shared = 123n;
+      stat.ino = options?.bigint ? (field === 'ino' ? identity : shared) : Number(field === 'ino' ? identity : shared);
+      stat.dev = options?.bigint ? (field === 'dev' ? identity : shared) : Number(field === 'dev' ? identity : shared);
+    }
+    return stat;
+  };
+  return () => { fs.lstat = lstat; };
+}
+
+for (const policy of ['auto', 'preserve', 'plaintext']) {
+  test('T10 ' + policy + '复制不能因64位inode舍入相等而跳过覆盖', async t => {
+    const f = await fixture(t);
+    const source = await f.sample('identity-source.txt', 'COPY');
+    const target = await f.sample('identity-target.txt', 'OLD');
+    await fs.chmod(source, 0o444);
+    const restore = collideNumericIdentity(source, target);
+    let response;
+    try { response = await f.call('copy_path', { source, destination: target, writePolicy: policy }); }
+    finally { restore(); }
+    const data = success(response);
+    assert.equal(data.changed, true);
+    assert.equal(await fs.readFile(target, 'utf8'), 'COPY');
+    assert.equal(await fs.readFile(source, 'utf8'), 'COPY');
+    assert.equal((await fs.stat(source)).mode & 0o200, 0);
+    assert.notEqual((await fs.stat(target)).mode & 0o200, 0);
+  });
+}
+
+test('T10 64位设备号舍入碰撞也不能把不同文件当成同一文件', async t => {
+  const f = await fixture(t);
+  const source = await f.sample('source.txt', 'COPY');
+  const target = await f.sample('target.txt', 'OLD');
+  const restore = collideNumericIdentity(source, target, 'dev');
+  let response;
+  try { response = await f.call('copy_path', { source, destination: target, writePolicy: 'preserve' }); }
+  finally { restore(); }
+  assert.equal(success(response).changed, true);
+  assert.equal(await fs.readFile(target, 'utf8'), 'COPY');
+});
+
+test('T10 64位inode碰撞时移动仍提交目标并只删除已验证源', async t => {
+  const f = await fixture(t);
+  const source = await f.sample('source.txt', 'MOVE');
+  const target = await f.sample('target.txt', 'OLD');
+  const restore = collideNumericIdentity(source, target);
+  let response;
+  try { response = await f.call('move_path', { source, destination: target, writePolicy: 'auto' }); }
+  finally { restore(); }
+  assert.equal(success(response).changed, true);
+  assert.equal(await fs.readFile(target, 'utf8'), 'MOVE');
+  await assert.rejects(fs.access(source), { code: 'ENOENT' });
+});
+
+test('T10 真实硬链接仍按同一文件处理，移动拒绝删源', async t => {
+  const f = await fixture(t);
+  const source = await f.sample('source.txt', 'LINKED');
+  const target = path.join(f.root, 'hardlink.txt');
+  await fs.link(source, target);
+  const sourceStat = await fs.lstat(source, { bigint: true });
+  const targetStat = await fs.lstat(target, { bigint: true });
+  assert.equal(sourceStat.ino, targetStat.ino);
+  assert.equal(sourceStat.dev, targetStat.dev);
+  assert.equal(success(await f.call('copy_path', { source, destination: target })).changed, false);
+  failure(await f.call('move_path', { source, destination: target }), 'SAME_FILE_ALIAS');
+  assert.equal(await fs.readFile(source, 'utf8'), 'LINKED');
+  assert.equal(await fs.readFile(target, 'utf8'), 'LINKED');
+  assert.equal((await fs.lstat(source, { bigint: true })).ino, sourceStat.ino);
 });
 
 test('T4 环境变量预算生效，非法预算在启动时拒绝', async t => {

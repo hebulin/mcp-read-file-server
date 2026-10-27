@@ -5,7 +5,7 @@ description: 在Node.js为加密软件白名单进程的环境中，使用文件
 
 # 加密环境文件操作
 
-使用前确认Node.js受信任，并配置read-file-server。版本2.1.4提供18个工具，最低Node20。
+使用前确认Node.js受信任，并配置read-file-server。版本2.1.5提供18个工具，最低Node20。
 
 ## 工具选择
 
