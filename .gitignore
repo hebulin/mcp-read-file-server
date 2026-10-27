@@ -20,3 +20,6 @@ dist/
 build/
 
 # 注意：package-lock.json 不忽略，需提交以保证可复现安装
+
+# 本地测试说明、报告与提示词不纳入仓库
+/test/**/*.[mM][dD]
