@@ -60,12 +60,17 @@ function simulatedProcess() {
 
 test('适配器预算：默认仍在5秒终止，读取失败保持不可验证而非伪造成功', async () => {
   const sim = simulatedProcess();
-  const pending = sim.api.inspectDisk('powershell', 'sample.tmp');
+  const processErrors = [];
+  const pending = sim.api.inspectDisk('powershell', 'sample.tmp', { processErrors });
   sim.advance(4999);
   assert.equal(sim.children[0].killed, false);
   sim.advance(2);
   assert.equal(sim.children[0].killed, true);
   assert.equal(await pending, null);
+  assert.equal(processErrors[0].code, 'PROCESS_TIMEOUT');
+  assert.equal(processErrors[0].processTimeoutMs, 5000);
+  assert.equal(processErrors[0].effectiveTimeoutMs, 5000);
+  assert.equal(processErrors[0].elapsedMs, 5001);
 });
 
 test('适配器预算：显式30秒预算允许6秒慢启动后返回完整指纹', async () => {

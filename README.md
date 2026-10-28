@@ -4,11 +4,11 @@
 
 加密环境文件操作工具。当 Node.js 是加密软件白名单进程时，通过 fs 模块自动解密读写文件明文，替代 AI Agent 内置文件工具，解决加密环境下读到密文的问题。适用于任何支持 MCP 协议的 AI Agent。
 
-## 最新版本：2.1.3（相对 1.0）
+## 最新版本：2.1.5（相对 1.0）
 
 本节以仓库 `v1.0` 标签（包版本 `1.0.0`）为基线，汇总当前版本的变化，不再逐条保留中间版本的更新说明。
 
-| 方面 | 1.0 | 2.1.3 |
+| 方面 | 1.0 | 2.1.5 |
 |------|-----|-------|
 | 文件写入 | 由 Node 直接读改写，依赖本机透明加密行为 | 统一暂存、备份、提交及终验；失败回滚，恢复失败保留 `recoveryPath` |
 | 加密策略 | 没有按原文件状态选择写入策略 | `auto` 比较原文件的 Node 与外部读取视图：原明文继续验证明文，原受保护文件保留受控写入；新建文件不凭 Node 可读就自动加密 |
@@ -19,11 +19,11 @@
 | 边界保护 | 主要依赖进程文件权限 | 可配置允许根、只读和禁删；识别真实路径/链接及受保护根；拒绝目录双向祖先重叠 |
 | 分发与验证 | 本地脚本启动，无仓库测试套件 | npm CLI 入口、模块化源码、结构化响应、回归/真实 stdio/Windows 适配测试及 CI；最低 Node.js 20 |
 
-**本次重点修复**：原始明文文件经 MCP 编辑后出现加密内容，而 Node 读回正常、编辑器却显示密文。修复基于每个文件的写入前状态，适用于所有扩展名、未知后缀、无扩展名和点文件。文本工具仍只接受有效 UTF-8，二进制文件通过复制/移动使用相同的提交保护。
+**本次重点修复**：复制/移动使用精确64位文件身份比较，避免不同文件因Number舍入被误判为同一文件，导致覆盖跳过却返回成功；真实硬链接仍保留保护。Windows 只读目标终验失败时可以恢复原文件及只读属性；复制只读源文件时先用可写暂存刷盘，再恢复目标权限。已通过终验的写入不会因为备份清理失败被撤销。首次环境探测在独立预算内继续，单个请求取消或超时不再连带其他等待者；外部进程预算可配置，错误保留超时诊断。逐文件的原明文保持明文、原受保护保持受保护、新建默认明文规则继续生效。
 
 **累计修复与优化**：拒绝非法 UTF-8、UTF-16 和 NUL 文本的破坏性编辑；修复分页边界、换行匹配、复制移动重叠、并发追加及部分失败状态；安全中转失败不再回退直写；锁和临时文件清理失败不会掩盖主操作结果；工作线程和扫描预算防止复杂表达式阻塞服务。依赖锁定与 overrides 用于复现已验证的依赖树。
 
-**升级行为变化**：显式 `writePolicy` 优先，其次是持久人工策略，再由 `auto` 观察文件状态。Windows 的 `auto` 缺少可用外部读取器时返回 `DISK_UNVERIFIED`，不会猜测后继续写入；需要新建受保护文件时明确指定 `preserve` 或配置人工 `protected`。更新后重启全部 MCP 实例，并用 `check_status` 确认运行版本为 `2.1.3`。
+**升级行为变化**：显式 `writePolicy` 优先，其次是持久人工策略，再由 `auto` 观察文件状态。Windows 的 `auto` 缺少可用外部读取器时返回 `DISK_UNVERIFIED`，不会猜测后继续写入；需要新建受保护文件时明确指定 `preserve` 或配置人工 `protected`。更新后重启全部 MCP 实例，并用 `check_status` 确认运行版本为 `2.1.5`。
 
 ## 适用场景
 
@@ -94,11 +94,15 @@ AI Agent  --(MCP/stdio)-->  Node.js MCP Server(index.js)  --(lib/ 模块)-->  fs
 ### 探测与缓存
 
 - **首次需要自动策略（或缓存失效）时探测**：在系统临时目录用候选扩展名写入样本，通过 Node 与外部进程指纹对照分类，并探测可用复制进程
+- **探测预算与取消**：同一实例共享一次最多60秒的后台探测；每个请求仍遵守自己的 `timeoutMs` 和取消信号。等待超时返回 `TIMEOUT` 与 `probeStatus:running`，探测继续并在完成后保存缓存，稍后调用可复用结果。探测本身失败后冷却5秒，错误返回 `retryAfterMs`；`refresh_profile` 可绕过冷却。后台仅完成环境探测，不继续已取消请求的目标写入
+- **慢机配置**：设置 `MCP_PROCESS_TIMEOUT_MS`（默认5000，整数1–60000）并重启实例；例如30000。它控制所有外部读取和复制进程，仍受当前操作总预算限制。`encryption_profile` 返回实际预算和 `probeErrors`，不可验证错误返回 `readerDiagnostics`，超时诊断含实际耗时与有效预算
 - **目录级探测**：无原文件或复制源状态可参考的新建路径，按「目标目录 × 扩展名」创建随机样本（`.mcp-probe-<uuid><ext>`，写完即删），观察缓存在内存 scopes 中。已有文件优先逐文件观察，不受旧目录分类覆盖
 - **自动缓存位置**：`~/.mcp-encryption-profile.json`（结构 v3），按 machineId（hostname+username 哈希）绑定，换电脑/换用户重新探测；有效期 30 天。兼容有效的 v2/v3 缓存，丢弃旧 scopes；v2 人工 protected 一次性迁移到独立策略目录
+- **暂不可用缓存**：Windows 未找到外部读取器的结果只缓存30秒，避免一次冷启动失败被保持30天；显式刷新可以立即重新探测
 - **人工策略独立存储**：`~/.mcp-file-policies/` 每个扩展名一个文件，刷新探测、TTL 过期、服务重启都不会删除人工标注
 - **查看/刷新**：用 `encryption_profile` 工具查看当前探测结果与人工策略；加密策略变更后用 `refresh_profile` 强制重探（只刷新自动探测，不动人工策略）；`inspect_write_strategy` 可预览某个目标路径将采用的写入策略而不修改目标文件
 - **无外部读取器时**：Windows 的 auto 返回 `DISK_UNVERIFIED`；非 Windows 且没有该后缀的加密观察时保留 Node 内容校验，返回 unknown 并告警。显式 plaintext 在所有平台都必须有可用外部读取器。配置过的读取器临时失败时不得降级为成功
+- **平台能力**：内置外部读取器目前仅支持Windows PowerShell/pwsh；Linux/macOS不能使用显式plaintext或人工unsafe来获得经外部验证的明文写入。人工unsafe可通过 `mark_extension(category=clear)` 清除；拒绝写入不会自动更改人工策略
 
 ### 写入策略（writePolicy）
 
@@ -132,14 +136,15 @@ write_file / edit_file / copy_path / move_path 均支持 `writePolicy` 参数：
   → fsync 刷盘 → 再次比对改前指纹（防并发改动）
   → 原文件 rename 为 .mcp-backup-<uuid><ext> → 暂存 rename 到位
   → 指纹终验（SHA256+size；自动状态策略同时检查外部读取视图）
-  → 成功删除备份；任一步失败自动回滚，回滚失败返回 recoveryPath（备份不得删除）
+  → 终验通过即提交完成；随后清理备份，失败只返回 cleanupErrors
+终验及之前步骤失败则回滚；回滚失败返回 recoveryPath（备份不得删除）
 ```
 
 - **完整载荷**：追加模式先在内存合成「原内容+新增」完整内容再走事务，纠正/重写不会丢原文与 BOM
 - **写入行尾**：write_file的eol=auto沿用原文件的主导行尾；新文件、空文件或原文无换行时，保留输入行尾（含混合换行）。显式lf/crlf只转换本次载荷；追加不会重写原有内容。此规则与加密状态策略独立
 - **safeWrite 失败即中止**：不再回退直写破坏原文；`SAFE_WRITE_FAILED` 的 `reasons` 保留候选失败原因。如果本次已创建父目录，失败仍返回 `changed=true` 和 `createdDirectories`；这些目录会保留，避免误删并发加入的内容
 - **跨实例锁**：使用同一 `MCP_PROFILE_DIR` 的实例经 `.mcp-file-locks/` 登记整组路径，同路径及祖先/后代相互排斥，无关路径可并行（等待 5 秒超时 FILE_BUSY）；`expectedHash` 可检测其他编辑器造成的版本变化（CONFLICT）。升级时应重启全部 MCP 实例，避免旧进程继续执行旧的锁和写入策略
-- **清理状态**：暂存、锁、探测、外部复制及配置保存的辅助文件清理失败会附带 `cleanupErrors`；主操作已成功时保留成功结果和真实 `changed`，错误时保留原错误及 `recoveryPath`。不要因清理告警重复追加内容
+- **清理状态**：备份、暂存、锁、探测、外部复制及配置保存的辅助文件清理失败会附带 `cleanupErrors`；主操作已成功时保留成功结果和真实 `changed`，错误时保留原错误及 `recoveryPath`。备份删除失败时原备份路径在 `cleanupErrors[].path` 中，新内容保持已提交状态。不要因清理告警重复追加内容
 - **递归删除**：逐项执行，失败时返回 `changed`、`partial`（最多100项）、`removedCount`、`partialTruncated`、`failedPath`；受一万项和128层预算限制，不是整树事务
 - **断电/强杀残留**：两次 rename 之间的极端崩溃可能留下 `.mcp-backup-*` 与 `.mcp-stage-*`，先核对内容与时间再人工恢复，禁止直接批量清理
 - **复制/移动目录**：逐文件执行相同策略；移动先复制并二次比对指纹后再删除已验证的源文件；失败返回 `partial` 与 `sourceRetained`，不静默回退；符号链接明确拒绝；源和最终目标存在任一方向的祖先关系时拒绝，相同路径保持不变。回滚失败时 `changed=true`，`partial` 包含当前失败目标，原备份通过 `recoveryPath` 返回
@@ -147,6 +152,7 @@ write_file / edit_file / copy_path / move_path 均支持 `writePolicy` 参数：
 - **策略探测互斥**：`inspect_write_strategy` 持有目标父目录锁，创建和清理探测样本完成后才允许该目录被复制、移动或删除
 - **glob总预算**：生产搜索与查找使用异步匹配，合并重复模式和分支；一次请求的展开后累计长度最多10万，编译和全部路径匹配共用5000万工作单元预算。约每16384工作单元让出事件循环，检查取消与截止时间；超过限额返回 `GLOB_LIMIT`，超时返回 `TIMEOUT`
 - **diskState 三态**：`plaintext`（Node 与外部视图均匹配预期明文）、`preserved`（Node 内容通过受控写入校验，不保证其他编辑器可解密）、`unknown`（仅内容校验，不能声称已验证明文）。自动保留原保护状态还返回 `protectionObserved:true`，表示外部视图仍不同，并非密钥或加密完整性认证
+- **明确校验范围**：`verificationScope=node` 表示只检查Node内容（显式/人工preserve同时返回 `protectionObserved:false`）；`node-and-external-state` 表示另观察了受保护状态；`node-and-external-content` 表示外部内容也匹配预期。为兼容已有调用者保留 `diskState:preserved`，不能单独把它理解为已观察磁盘保护状态
 - **校验边界**：如果外部读取器也被透明解密，两种视图一致仍不能证明原始磁盘未加密。上线前用真实驱动及目标编辑器验收；已经损坏或已经加密的异常文件不会因升级而自动修复
 
 ## 文件结构
@@ -308,8 +314,9 @@ claude mcp list
 | `MCP_BASE_DIR` | 服务启动目录；所有相对路径的基准 |
 | `MCP_ALLOWED_ROOTS` | 可选绝对路径 JSON 数组（如 `["D:/Projects"]`）；设置后所有文件操作限制在根目录内，未设置继承 Node 进程文件权限 |
 | `MCP_READ_ONLY` | `1` 禁用全部修改类工具（保留读操作；edit_file dryRun 仍可预览） |
-| `MCP_DISABLE_DELETE` | `1` 禁用 remove_path |
+| `MCP_DISABLE_DELETE` | `1` 禁用 remove_path（包括dryRun）；不禁用move_path的删源，也不禁止覆盖写入。需要禁止全部修改时使用MCP_READ_ONLY |
 | `MCP_PROFILE_DIR` | 探测缓存/人工策略/锁文件的存放目录，默认用户主目录；建议保持稳定，测试必须独立设置 |
+| `MCP_PROCESS_TIMEOUT_MS` | 外部读取/复制单进程预算，默认5000毫秒，整数1–60000；慢机可设30000，重启后生效，仍受操作总预算约束 |
 
 ## 提供的工具
 
@@ -518,7 +525,7 @@ npm test         # 仓库内回归/协议/适配测试（Node 内置 test runner
 npm audit --omit=dev
 ```
 
-测试位于 `test/`，包含基础回归、真实 stdio、Windows 适配器、边界/并发修复、通用写入状态回归和异常清理/正则预算专项；模拟读取视图与真实驱动验收分开，不触碰真实 profile。可通过 `MCP_TEST_ROOT` 指定独立测试目录。CI 配置覆盖 Windows/Linux × Node 20/22/24。运行依赖：MCP SDK 1.31.0、Zod 4.4.3，间接依赖 fast-uri/qs/Hono/ip-address/proxy-addr 通过 overrides 限定修复版本。
+测试位于 `test/`，包含基础回归、真实 stdio、Windows 适配器、边界/并发修复、通用写入状态回归和异常清理/正则预算专项；模拟读取视图与真实驱动验收分开，不触碰真实 profile。可通过 `MCP_TEST_ROOT` 指定独立测试目录。CI 配置覆盖 Windows/Linux × Node 20/22/24。运行依赖：MCP SDK 1.32.2、Zod 4.6.7，间接依赖 fast-uri/qs/Hono/ip-address/proxy-addr 通过 overrides 限定修复版本。
 
 ## 故障排查
 
@@ -541,7 +548,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 
 Node 可读不等于其他编辑器可读，不能只凭锁图标判断状态。当前版本对所有文件类型统一处理原明文状态。若仍出现异常：
 
-1. 用 `check_status` 确认实际服务为 2.1.3，保留异常文件和当次完整响应，不直接覆盖修复。
+1. 用 `check_status` 确认实际服务为 2.1.5，保留异常文件和当次完整响应，不直接覆盖修复。
 2. 查看 `strategy.basis/originalState`、`diskState/diskVerified` 和 warnings，确认是否有显式 preserve 或人工 protected 覆盖自动决策。
 3. 使用独立副本验证所需策略，并检查外部读取器是否同样被透明解密。已经异常的受保护文件不会被 auto 自动解密；需要恢复时先核对原始备份。
 
